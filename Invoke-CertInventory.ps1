@@ -8,10 +8,10 @@
   certificate, and records the common name, SAN, template, serial, and resolved
   IP addresses.
 
-  Each valid client certificate is looked up by common name, or by exactly one SAN
-  when the common name is not on a valid certificate. The serial number on the
-  certificate that lookup returns is the value used for validation. When both the
-  common name and that one SAN resolve, the two serials are compared.
+  Each issued certificate is the base record. Its common name and each SAN are clients of
+  that serial. Several clients may use the same certificate; that is not a conflict.
+  The collector then probes each client on this network: active, inactive, not in DNS,
+  or not on the network. The check is the last-5-minute status for the air-gapped console.
 
   Output is cert-inventory.json (schema ca-ledger/1) for the CA Ledger console.
   Run this on a machine with the Certification Authority console (certadm.dll).
@@ -607,6 +607,102 @@ function Get-ClientValidations {
     return @($rows)
 }
 
+$script:ProbeCache = @{}
+function Get-CertClientNames {
+    param($Cert)
+    $rows = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $cn = [string]$Cert.cn
+    if (-not [string]::IsNullOrWhiteSpace($cn)) {
+        $rows.Add([ordered]@{ client = $cn; via = 'cn' })
+        $seen[$cn.ToLower()] = $true
+    }
+    foreach ($san in @($Cert.sans)) {
+        if ($san.type -ne 'dns' -and $san.type -ne 'ip') { continue }
+        $value = [string]$san.value
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if ($seen.ContainsKey($value.ToLower())) { continue }
+        $seen[$value.ToLower()] = $true
+        $rows.Add([ordered]@{ client = $value; via = 'san' })
+    }
+    return @($rows)
+}
+
+function Get-ClientProbe {
+    param([string] $Name)
+    if ($script:ProbeCache.ContainsKey($Name)) { return $script:ProbeCache[$Name] }
+    $isIp = $Name -match '^\d{1,3}(\.\d{1,3}){3}$'
+    $ips = @()
+    if ($isIp) { $ips = @($Name) }
+    else { $ips = @(Resolve-InventoryIps -Name $Name) }
+    $result = [ordered]@{ status = 'not-in-dns'; address = $null }
+    if ($ips.Count -eq 0) {
+        $result.status = $(if ($isIp) { 'not-on-network' } else { 'not-in-dns' })
+    } else {
+        $target = [string]$ips[0]
+        $result.address = $target
+        try {
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            $reply = $ping.Send($target, 1000)
+            if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                $result.status = 'active'
+            } else {
+                $down = @(
+                    [System.Net.NetworkInformation.IPStatus]::DestinationUnreachable,
+                    [System.Net.NetworkInformation.IPStatus]::DestinationHostUnreachable,
+                    [System.Net.NetworkInformation.IPStatus]::DestinationNetworkUnreachable,
+                    [System.Net.NetworkInformation.IPStatus]::DestinationProhibited,
+                    [System.Net.NetworkInformation.IPStatus]::DestinationProtocolUnreachable,
+                    [System.Net.NetworkInformation.IPStatus]::DestinationPortUnreachable,
+                    [System.Net.NetworkInformation.IPStatus]::HardwareError,
+                    [System.Net.NetworkInformation.IPStatus]::BadDestination
+                )
+                if ($down -contains $reply.Status -or $isIp) { $result.status = 'not-on-network' }
+                else { $result.status = 'inactive' }
+            }
+        } catch {
+            $result.status = $(if ($isIp) { 'not-on-network' } else { 'inactive' })
+        }
+    }
+    $script:ProbeCache[$Name] = $result
+    return $result
+}
+
+function Get-ClientChecks {
+    param($Certificates, [datetime] $Now, [bool] $DemoMode)
+    # CA inventory is the base. Each CN and SAN is a client of that certificate serial.
+    # Several clients on one certificate is expected, not a conflict.
+    $valid = @($Certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $Now })
+    $checked = $Now.ToString('o')
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($cert in $valid) {
+        $fallback = @($cert.sans | Where-Object { $_.type -eq 'ip' } | Select-Object -First 1)
+        $fallbackIp = if ($fallback.Count) { [string]$fallback[0].value } else { $null }
+        foreach ($item in @(Get-CertClientNames -Cert $cert)) {
+            $status = 'active'
+            $address = $fallbackIp
+            if (-not $DemoMode) {
+                $probe = Get-ClientProbe -Name $item.client
+                $status = [string]$probe.status
+                $address = $probe.address
+            } elseif ($item.client -notmatch '\.' ) {
+                $status = 'not-in-dns'
+                $address = $null
+            }
+            $rows.Add([ordered]@{
+                certId    = $cert.id
+                serial    = $cert.serial
+                client    = $item.client
+                via       = $item.via
+                status    = $status
+                checkedAt = $checked
+                address   = $address
+            })
+        }
+    }
+    return @($rows)
+}
+
 function Get-DemoSnapshot {
     $now = [datetime]::UtcNow
     function D([int] $Days) { return $now.AddDays($Days).ToString('o') }
@@ -701,10 +797,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
 }
 
 $nowUtc = [datetime]::UtcNow
-$findings = @(Get-SerialFindings -Certificates $snapshot.certificates -Now $nowUtc)
-$validations = @(Get-ClientValidations -Certificates $snapshot.certificates -Now $nowUtc)
-$snapshot['comparisons'] = @($findings)
-$snapshot['validations'] = @($validations)
+$demoMode = $PSCmdlet.ParameterSetName -eq 'Demo'
+$checks = @(Get-ClientChecks -Certificates $snapshot.certificates -Now $nowUtc -DemoMode $demoMode)
+$snapshot['clientChecks'] = @($checks)
+$snapshot['statusWindowMinutes'] = 5
 $validCount = @($snapshot.certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $nowUtc }).Count
 $expiring = @($snapshot.certificates | Where-Object {
     (Test-InventoryValid -Cert $_ -Now $nowUtc) -and
@@ -728,17 +824,17 @@ foreach ($row in ($expiring | Sort-Object { [datetimeoffset]::Parse([string]$_.n
     $days = [Math]::Ceiling(([datetimeoffset]::Parse([string]$row.notAfter).UtcDateTime - $nowUtc).TotalDays)
     Write-Host ("    {0,3}d  {1}  {2}  {3}" -f $days, $row.cn, $ipText, $row.issuerName)
 }
-Write-Host ("  Client validation       {0}" -f $validations.Count)
-foreach ($check in $validations) {
-    $mark = if ($check.verified) { 'ok' } else { 'check' }
-    Write-Host ("    {0,-5} via {1,-3} {2}" -f $mark, $check.via, $check.name)
-    Write-Host ("           serial {0}" -f (@($check.serials) -join ', '))
+Write-Host ("  Client status, last {0} min" -f 5)
+$byStatus = @{ active = 0; inactive = 0; 'not-in-dns' = 0; 'not-on-network' = 0 }
+foreach ($check in @($checks)) {
+    if ($byStatus.ContainsKey([string]$check.status)) { $byStatus[[string]$check.status]++ }
 }
-Write-Host ("  Serial conflicts        {0}" -f $findings.Count)
-foreach ($finding in $findings) {
-    Write-Host ("    {0,-12} {1}  SAN {2}" -f $finding.kind, $finding.cn, $finding.san)
-    Write-Host ("                 CN  {0}" -f (@($finding.cnSerials) -join ', '))
-    Write-Host ("                 SAN {0}" -f (@($finding.sanSerials) -join ', '))
+Write-Host ("    active           {0}" -f $byStatus.active)
+Write-Host ("    inactive         {0}" -f $byStatus.inactive)
+Write-Host ("    not in DNS       {0}" -f $byStatus['not-in-dns'])
+Write-Host ("    not on network   {0}" -f $byStatus['not-on-network'])
+foreach ($check in @($checks | Where-Object { $_.status -ne 'active' })) {
+    Write-Host ("    {0,-16} {1,-3} {2}  serial {3}" -f $check.status, $check.via, $check.client, $check.serial)
 }
 Write-Host ("Wrote {0}" -f $path)
 if (@($snapshot.errors).Count -gt 0) { exit 2 }
