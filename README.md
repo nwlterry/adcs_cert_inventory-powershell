@@ -2,7 +2,7 @@
 
 Collect issued certificates from a two-tier AD CS hierarchy (offline root, two or more issuing CAs). The CA inventory is the base. For each valid certificate, the common name and every DNS or IP SAN is a client of that serial. Several clients may use the same certificate. That is not a conflict.
 
-The collector probes each client on the local network and records the last-5-minute status: active, inactive, not in DNS, or not on the network. Copy `cert-inventory.json` to the console host. The console does not resolve names and does not use the internet.
+The collector probes each client on the local network and records the last-5-minute status: active, inactive, not in DNS, or not on the network. `-Serve` then hosts the on-prem dashboard on this machine, next to that JSON file. The page only reads the inventory from the same host. It does not resolve names and it does not use the internet.
 
 Run this on a workstation that can reach every issuing CA and has the Certification Authority tools installed (`certadm.dll`, RSAT: AD CS). Windows PowerShell 5.1 or PowerShell 7.
 
@@ -19,8 +19,10 @@ powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\Invoke-CertInventory
     'pki-ica02.corp.local\CORP-ISSUING-CA-02'
   ) `
   -RootCaName 'CORP-OFFLINE-ROOT-CA' `
-  -OutputPath .\cert-inventory.json
+  -Serve
 ```
+
+Open `http://127.0.0.1:8787/` on that machine. Keep `dashboard\index.html` beside the script. That folder is the console.
 
 | Parameter | Role |
 |---|---|
@@ -31,6 +33,17 @@ powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\Invoke-CertInventory
 | `-IncludeExpired` | Also keep certificates that have already expired. Default is unexpired issued and revoked rows. |
 | `-SkipDns` | Do not resolve CN and DNS SAN names while building the system list. The client-status probe still runs. |
 | `-Demo` | Write a small file and do not contact a CA, DNS, or the network. |
+| `-Serve` | After collection, host the on-prem dashboard until Ctrl+C. |
+| `-Listen` | HTTP prefix. Default `http://127.0.0.1:8787/`. One address only. Do not use `+` or `*`. |
+| `-HostOnly` | Serve the JSON already at `-OutputPath`. No CA and no probe. |
+
+To show the console to another host on the same isolated network, bind one address on that network:
+
+```powershell
+.\Invoke-CertInventory.ps1 -HostOnly -OutputPath .\cert-inventory.json -Listen 'http://10.16.1.50:8787/'
+```
+
+If Windows refuses that prefix, reserve it once: `netsh http add urlacl url=http://10.16.1.50:8787/ user=DOMAIN\ops`. Loopback does not need a reservation. The listener answers GET and HEAD only, and only `/` and `/cert-inventory.json`.
 
 Exit codes: `0` collected, `1` nothing collected, `2` collected but at least one issuing CA failed.
 
@@ -68,7 +81,7 @@ A name is sent to DNS or ping only when it is a DNS name, or a unicast IPv4 addr
 
 ## Security
 
-- The collector is the only program that talks to the CAs, DNS, and ICMP. The dashboard only reads the JSON file.
+- The collector is the only program that talks to the CAs, DNS, and ICMP. The dashboard is hosted by that same process and only reads the JSON file. It makes no outbound call.
 - `certutil.exe` is started with a separate argument for the CA config, not through `cmd.exe`. The config must be `hostname\CA Name`. It cannot start with `-` or contain quotes, newlines, or shell characters.
 - Certificate bytes from the CA are loaded as a certificate. They are not executed.
 - Do not commit a live `cert-inventory.json`.

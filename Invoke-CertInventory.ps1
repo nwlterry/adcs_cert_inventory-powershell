@@ -13,7 +13,10 @@
   The collector then probes each client on this network: active, inactive, not in DNS,
   or not on the network. The check is the last-5-minute status for the air-gapped console.
 
-  Output is cert-inventory.json (schema ca-ledger/1) for the CA Ledger console.
+  Output is cert-inventory.json (schema ca-ledger/1). With -Serve, this process hosts
+  the on-prem dashboard beside that file. The page only reads the local inventory.
+  It does not resolve names and it does not use the internet.
+
   Run this on a machine with the Certification Authority console (certadm.dll).
   The offline root is recorded by name only. End-entity rows come from issuing CAs.
 
@@ -35,6 +38,16 @@
 .PARAMETER SkipDns
   Do not resolve CN and DNS SAN names.
 
+.PARAMETER Serve
+  After collection, host the on-prem dashboard until Ctrl+C.
+
+.PARAMETER Listen
+  HTTP prefix for -Serve. Default http://127.0.0.1:8787/
+  Bind loopback, or one address on the isolated network. Do not use + or *.
+
+.PARAMETER HostOnly
+  Serve the JSON already at -OutputPath. Does not contact a CA or the network.
+
 .PARAMETER Demo
   Write a small sample file and do not contact a CA.
 
@@ -42,7 +55,10 @@
   .\Invoke-CertInventory.ps1 -IssuingCa @(
     'pki-ica01.corp.local\CORP-ISSUING-CA-01',
     'pki-ica02.corp.local\CORP-ISSUING-CA-02'
-  ) -RootCaName 'CORP-OFFLINE-ROOT-CA' -OutputPath .\cert-inventory.json
+  ) -RootCaName 'CORP-OFFLINE-ROOT-CA' -Serve
+
+.EXAMPLE
+  .\Invoke-CertInventory.ps1 -HostOnly -OutputPath .\cert-inventory.json
 #>
 [CmdletBinding(DefaultParameterSetName = 'Live')]
 param(
@@ -55,6 +71,7 @@ param(
 
     [Parameter(ParameterSetName = 'Live')]
     [Parameter(ParameterSetName = 'Demo')]
+    [Parameter(ParameterSetName = 'Host')]
     [string] $OutputPath = '.\cert-inventory.json',
 
     [Parameter(ParameterSetName = 'Live')]
@@ -65,7 +82,20 @@ param(
     [switch] $IncludeExpired,
 
     [Parameter(ParameterSetName = 'Live')]
+    [Parameter(ParameterSetName = 'Demo')]
     [switch] $SkipDns,
+
+    [Parameter(ParameterSetName = 'Live')]
+    [Parameter(ParameterSetName = 'Demo')]
+    [switch] $Serve,
+
+    [Parameter(ParameterSetName = 'Live')]
+    [Parameter(ParameterSetName = 'Demo')]
+    [Parameter(ParameterSetName = 'Host')]
+    [string] $Listen = 'http://127.0.0.1:8787/',
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Host')]
+    [switch] $HostOnly,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Demo')]
     [switch] $Demo
@@ -810,6 +840,80 @@ function Write-InventoryJson {
     return $full
 }
 
+function Start-OnPremDashboard {
+    param([string] $JsonPath, [string] $Prefix)
+    $htmlPath = Join-Path $PSScriptRoot 'dashboard\index.html'
+    if (-not (Test-Path -LiteralPath $htmlPath)) {
+        throw "On-prem dashboard is missing: $htmlPath. Keep the dashboard folder beside this script."
+    }
+    if ($Prefix -notmatch '/$') { $Prefix = $Prefix + '/' }
+    if ($Prefix -match '[\r\n\x00\+\*]' -or $Prefix -notmatch '^http://[A-Za-z0-9._:-]+:\d+/$') {
+        throw "Listen must be one http address with a port, such as http://127.0.0.1:8787/. Do not use + or *."
+    }
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add($Prefix)
+    try {
+        $listener.Start()
+    } catch {
+        throw "Could not listen on $Prefix. Loopback usually needs no reservation. For another address on the isolated network, reserve it once: netsh http add urlacl url=$Prefix user=$env:USERDOMAIN\$env:USERNAME. $($_.Exception.Message)"
+    }
+    Write-Host ''
+    Write-Host ("On-prem dashboard  {0}" -f $Prefix)
+    Write-Host 'This process serves only the console and cert-inventory.json. It does not open an outbound connection.'
+    Write-Host 'Press Ctrl+C to stop.'
+    $htmlBytes = [System.IO.File]::ReadAllBytes($htmlPath)
+    try {
+        while ($listener.IsListening) {
+            $context = $listener.GetContext()
+            $request = $context.Request
+            $response = $context.Response
+            try {
+                $response.Headers['X-Content-Type-Options'] = 'nosniff'
+                $response.Headers['Cache-Control'] = 'no-store'
+                $response.Headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'"
+                if ($request.HttpMethod -ne 'GET' -and $request.HttpMethod -ne 'HEAD') {
+                    $response.StatusCode = 405
+                } else {
+                    $route = $request.Url.AbsolutePath
+                    $bytes = $null
+                    if ($route -eq '/' -or $route -eq '/index.html') {
+                        $response.ContentType = 'text/html; charset=utf-8'
+                        $bytes = $htmlBytes
+                    } elseif ($route -eq '/cert-inventory.json') {
+                        $response.ContentType = 'application/json; charset=utf-8'
+                        $bytes = [System.IO.File]::ReadAllBytes($JsonPath)
+                    } else {
+                        $response.StatusCode = 404
+                    }
+                    if ($null -ne $bytes) {
+                        $response.ContentLength64 = $bytes.Length
+                        if ($request.HttpMethod -ne 'HEAD') {
+                            $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                        }
+                    }
+                }
+            } catch {
+                try { $response.StatusCode = 500 } catch { }
+            } finally {
+                try { $response.Close() } catch { }
+            }
+        }
+    } finally {
+        $listener.Stop()
+        $listener.Close()
+    }
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Host') {
+    $existing = [System.IO.Path]::GetFullPath($OutputPath)
+    if (-not (Test-Path -LiteralPath $existing)) {
+        Write-Host "No inventory at $existing. Collect first, or pass -Demo -Serve."
+        exit 1
+    }
+    Start-OnPremDashboard -JsonPath $existing -Prefix $Listen
+    exit 0
+}
+
 if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
@@ -898,5 +1002,11 @@ foreach ($check in @($checks | Where-Object { $_.status -ne 'active' })) {
     Write-Host ("    {0,-16} {1,-3} {2}  serial {3}" -f $check.status, $check.via, $check.client, $check.serial)
 }
 Write-Host ("Wrote {0}" -f $path)
+if ($Serve) {
+    $exitCode = 0
+    if (@($snapshot.errors).Count -gt 0) { $exitCode = 2 }
+    Start-OnPremDashboard -JsonPath $path -Prefix $Listen
+    exit $exitCode
+}
 if (@($snapshot.errors).Count -gt 0) { exit 2 }
 exit 0
