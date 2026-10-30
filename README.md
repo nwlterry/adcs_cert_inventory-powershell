@@ -10,6 +10,8 @@ The offline root is recorded by name only. End-entity rows come from the issuing
 
 .NET 8 port: [adcs_cert_inventory_dotnet](https://github.com/nwlterry/adcs_cert_inventory_dotnet).
 
+The console can also run as a container on the isolated network. The container only serves the JSON this script writes. It does not contact a CA. [adcs_cert_inventory-container](https://github.com/nwlterry/adcs_cert_inventory-container).
+
 ## Collect
 
 ```powershell
@@ -34,7 +36,7 @@ Open `http://127.0.0.1:8787/` on that machine. Keep `dashboard\index.html` besid
 | `-SkipDns` | Do not resolve CN and DNS SAN names while building the system list. The client-status probe still runs. |
 | `-Demo` | Write a small file and do not contact a CA, DNS, or the network. |
 | `-Serve` | After collection, host the on-prem dashboard until Ctrl+C. |
-| `-Listen` | HTTP prefix. Default `http://127.0.0.1:8787/`. One address only. Do not use `+` or `*`. |
+| `-Listen` | HTTP prefix. Default `http://127.0.0.1:8787/`. One address, or `http://+:8787/` inside a container. |
 | `-HostOnly` | Serve the JSON already at `-OutputPath`. No CA and no probe. |
 
 To show the console to another host on the same isolated network, bind one address on that network:

@@ -43,7 +43,8 @@
 
 .PARAMETER Listen
   HTTP prefix for -Serve. Default http://127.0.0.1:8787/
-  Bind loopback, or one address on the isolated network. Do not use + or *.
+  Bind loopback, or one address on the isolated network.
+  A container uses http://+:8787/ so the published port is reachable.
 
 .PARAMETER HostOnly
   Serve the JSON already at -OutputPath. Does not contact a CA or the network.
@@ -847,8 +848,8 @@ function Start-OnPremDashboard {
         throw "On-prem dashboard is missing: $htmlPath. Keep the dashboard folder beside this script."
     }
     if ($Prefix -notmatch '/$') { $Prefix = $Prefix + '/' }
-    if ($Prefix -match '[\r\n\x00\+\*]' -or $Prefix -notmatch '^http://[A-Za-z0-9._:-]+:\d+/$') {
-        throw "Listen must be one http address with a port, such as http://127.0.0.1:8787/. Do not use + or *."
+    if ($Prefix -match '[\r\n\x00]' -or $Prefix -notmatch '^http://(\+|\*|[A-Za-z0-9._-]+):\d+/$') {
+        throw "Listen must be one http address with a port, such as http://127.0.0.1:8787/. A container uses http://+:8787/."
     }
     $listener = New-Object System.Net.HttpListener
     $listener.Prefixes.Add($Prefix)
