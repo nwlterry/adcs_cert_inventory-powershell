@@ -1,0 +1,40 @@
+name: Security scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patterns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject dangerous invocation patterns
+        run: |
+          python3 - << 'PY'
+          import pathlib, sys
+          needles = [
+              "Invoke-Expression",
+              "IEX ",
+              "cmd.exe",
+              "UnsafeRelaxedJsonEscaping",
+              "UseShellExecute = true",
+          ]
+          bad = []
+          for path in pathlib.Path(".").rglob("*"):
+              if not path.is_file() or path.suffix.lower() not in {".ps1", ".cs"}:
+                  continue
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              for needle in needles:
+                  if needle in text:
+                      bad.append(f"{path}: {needle}")
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print("pattern scan: no blocked invocations")
+          PY
