@@ -1,13 +1,17 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Collect issued certificates from a two-tier AD CS hierarchy and compare serials.
+  Collect issued certificates from a two-tier AD CS hierarchy and validate them by serial.
 
 .DESCRIPTION
   Queries each issuing CA (two or more) for issued and revoked requests, loads the
   certificate, and records the common name, SAN, template, serial, and resolved
-  IP addresses. Valid certificates are then checked by getting the common name and
-  looking up one SAN. The serial sets are compared.
+  IP addresses.
+
+  Each valid client certificate is looked up by common name, or by exactly one SAN
+  when the common name is not on a valid certificate. The serial number on the
+  certificate that lookup returns is the value used for validation. When both the
+  common name and that one SAN resolve, the two serials are compared.
 
   Output is cert-inventory.json (schema ca-ledger/1) for the CA Ledger console.
   Run this on a machine with the Certification Authority console (certadm.dll).
@@ -533,7 +537,8 @@ function Test-InventoryValid {
 
 function Get-SerialFindings {
     param($Certificates, [datetime] $Now)
-    # Same rule as the CA Ledger console: get by CN, look up one SAN, compare serial sets.
+    # Look up by CN, or by one SAN when the CN is not on a valid certificate.
+    # The serial that lookup returns is the serial used for validation.
     $valid = @($Certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $Now })
     $seen = @{}
     $findings = New-Object System.Collections.Generic.List[object]
@@ -564,6 +569,42 @@ function Get-SerialFindings {
         })
     }
     return @($findings)
+}
+
+function Get-ClientValidations {
+    param($Certificates, [datetime] $Now)
+    # Verify each client certificate by CN, or by exactly one SAN, then take its serial.
+    $valid = @($Certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $Now })
+    $seen = @{}
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($cert in $valid) {
+        $name = [string]$cert.cn
+        $via = 'cn'
+        $key = ('cn|' + $name.ToLower())
+        $matched = @()
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            $matched = @($valid | Where-Object { $_.cn.ToLower() -eq $name.ToLower() })
+        }
+        if ($matched.Count -eq 0) {
+            $via = 'san'
+            $name = Select-InventorySan -Cert $cert
+            $key = ('san|' + $name.ToLower())
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $matched = @($valid | Where-Object {
+                @($_.sans | Where-Object { $_.value.ToLower() -eq $name.ToLower() }).Count -gt 0
+            })
+        }
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $serials = @($matched | ForEach-Object { $_.serial } | Select-Object -Unique)
+        $rows.Add([ordered]@{
+            name     = $name
+            via      = $via
+            serials  = @($serials)
+            verified = ($serials.Count -eq 1)
+        })
+    }
+    return @($rows)
 }
 
 function Get-DemoSnapshot {
@@ -661,7 +702,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
 
 $nowUtc = [datetime]::UtcNow
 $findings = @(Get-SerialFindings -Certificates $snapshot.certificates -Now $nowUtc)
+$validations = @(Get-ClientValidations -Certificates $snapshot.certificates -Now $nowUtc)
 $snapshot['comparisons'] = @($findings)
+$snapshot['validations'] = @($validations)
 $validCount = @($snapshot.certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $nowUtc }).Count
 $expiring = @($snapshot.certificates | Where-Object {
     (Test-InventoryValid -Cert $_ -Now $nowUtc) -and
@@ -684,6 +727,12 @@ foreach ($row in ($expiring | Sort-Object { [datetimeoffset]::Parse([string]$_.n
     $ipText = if ($ips.Count) { $ips -join ', ' } else { 'no IP' }
     $days = [Math]::Ceiling(([datetimeoffset]::Parse([string]$row.notAfter).UtcDateTime - $nowUtc).TotalDays)
     Write-Host ("    {0,3}d  {1}  {2}  {3}" -f $days, $row.cn, $ipText, $row.issuerName)
+}
+Write-Host ("  Client validation       {0}" -f $validations.Count)
+foreach ($check in $validations) {
+    $mark = if ($check.verified) { 'ok' } else { 'check' }
+    Write-Host ("    {0,-5} via {1,-3} {2}" -f $mark, $check.via, $check.name)
+    Write-Host ("           serial {0}" -f (@($check.serials) -join ', '))
 }
 Write-Host ("  Serial conflicts        {0}" -f $findings.Count)
 foreach ($finding in $findings) {
