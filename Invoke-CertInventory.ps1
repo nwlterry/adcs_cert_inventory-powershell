@@ -233,7 +233,7 @@ function Split-CaConfig {
     param([string] $Config)
     $clean = $Config.Trim().TrimStart('\')
     $parts = $clean -split '\\', 2
-    if ($parts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($parts[0]) -or [string]::IsNullOrWhiteSpace($parts[1])) {
+    if ($parts.Count -lt 2 -or -not (Test-CaToken -Value $parts[0] -AllowSpace:$false) -or -not (Test-CaToken -Value $parts[1] -AllowSpace:$true)) {
         throw "Issuing CA config must be 'hostname\CA Name'. Got '$Config'."
     }
     return [ordered]@{
@@ -241,6 +241,14 @@ function Split-CaConfig {
         name   = $parts[1]
         config = ('{0}\{1}' -f $parts[0], $parts[1])
     }
+}
+
+function Test-CaToken {
+    param([string] $Value, [bool] $AllowSpace)
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 200 -or $Value.StartsWith('-')) { return $false }
+    if ($Value -match "[\r\n\x00`"'\x26|;``$<>]") { return $false }
+    if (-not $AllowSpace -and $Value -match '\s') { return $false }
+    return $true
 }
 
 function Get-ColumnRaw {
@@ -333,6 +341,7 @@ function Resolve-InventoryIps {
             $ips = @($task.Result |
                 Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
                 ForEach-Object { $_.IPAddressToString } |
+                Where-Object { Test-UnicastIpv4 -Name $_ } |
                 Select-Object -Unique)
         }
     } catch {
@@ -434,7 +443,12 @@ function ConvertFrom-CaBag {
     if ($raw) {
         $cert = $null
         try {
-            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$raw)
+            $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+            try {
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($raw, [NullString]::Value, $flags)
+            } catch {
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$raw)
+            }
             $cn = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
             if (-not $cn) { $cn = $requestCn }
             $subject = $cert.Subject
@@ -476,7 +490,6 @@ function Get-HexDumpBytes {
 
 function Get-RowsFromCertutil {
     param($Issuer)
-    $restrict = 'Disposition=20'
     $blocks = @()
     foreach ($code in @('Disposition=20', 'Disposition=21')) {
         $output = & certutil.exe -config $Issuer.config -view -restrict $code -out 'RequestID,SerialNumber,Request.RequesterName,Request.CommonName,CertificateTemplate,NotBefore,NotAfter,Request.Disposition,RevokedWhen,RawCertificate' 2>&1 | Out-String
@@ -507,7 +520,6 @@ function Get-RowsFromCertutil {
         if ($null -ne $record) { $records.Add($record) }
     }
     return @($records)
-    $restrict | Out-Null
 }
 
 function Select-InventorySan {
@@ -628,10 +640,58 @@ function Get-CertClientNames {
     return @($rows)
 }
 
+function Test-UnicastIpv4 {
+    param([string] $Name)
+    $parts = $Name.Split('.')
+    if ($parts.Count -ne 4) { return $false }
+    $octets = New-Object System.Collections.Generic.List[int]
+    foreach ($part in $parts) {
+        $n = 0
+        if (-not [int]::TryParse($part, [ref]$n)) { return $false }
+        if ($part.Length -gt 1 -and $part.StartsWith('0')) { return $false }
+        if ($n -lt 0 -or $n -gt 255) { return $false }
+        $octets.Add($n)
+    }
+    if ($octets[0] -eq 0 -or $octets[0] -ge 224) { return $false }
+    return $true
+}
+
+function Test-DnsClientName {
+    param([string] $Name)
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 253) { return $false }
+    if ($Name.StartsWith('.') -or $Name.EndsWith('.')) { return $false }
+    foreach ($label in $Name.Split('.')) {
+        if ($label.Length -lt 1 -or $label.Length -gt 63) { return $false }
+        if ($label -notmatch '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$') { return $false }
+    }
+    return $true
+}
+
+function Get-ProbeKind {
+    param([string] $Name)
+    if ($Name -match '^\d{1,3}(\.\d{1,3}){3}$') {
+        if (Test-UnicastIpv4 -Name $Name) { return 'ip' }
+        return 'rejected-ip'
+    }
+    if (Test-DnsClientName -Name $Name) { return 'host' }
+    return 'rejected-host'
+}
+
 function Get-ClientProbe {
     param([string] $Name)
     if ($script:ProbeCache.ContainsKey($Name)) { return $script:ProbeCache[$Name] }
-    $isIp = $Name -match '^\d{1,3}(\.\d{1,3}){3}$'
+    $kind = Get-ProbeKind -Name $Name
+    if ($kind -eq 'rejected-host') {
+        $result = [ordered]@{ status = 'not-in-dns'; address = $null }
+        $script:ProbeCache[$Name] = $result
+        return $result
+    }
+    if ($kind -eq 'rejected-ip') {
+        $result = [ordered]@{ status = 'not-on-network'; address = $null }
+        $script:ProbeCache[$Name] = $result
+        return $result
+    }
+    $isIp = $kind -eq 'ip'
     $ips = @()
     if ($isIp) { $ips = @($Name) }
     else { $ips = @(Resolve-InventoryIps -Name $Name) }
@@ -676,7 +736,7 @@ function Get-ClientChecks {
     $checked = $Now.ToString('o')
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($cert in $valid) {
-        $fallback = @($cert.sans | Where-Object { $_.type -eq 'ip' } | Select-Object -First 1)
+        $fallback = @($cert.sans | Where-Object { $_.type -eq 'ip' -and (Test-UnicastIpv4 -Name ([string]$_.value)) } | Select-Object -First 1)
         $fallbackIp = if ($fallback.Count) { [string]$fallback[0].value } else { $null }
         foreach ($item in @(Get-CertClientNames -Cert $cert)) {
             $status = 'active'
@@ -743,6 +803,7 @@ function Get-DemoSnapshot {
 function Write-InventoryJson {
     param($Snapshot, [string] $Path)
     $json = $Snapshot | ConvertTo-Json -Depth 8
+    if ($Path -match "[\r\n\x00]") { throw "Output path is not valid." }
     $full = [System.IO.Path]::GetFullPath($Path)
     $utf8 = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($full, $json, $utf8)
