@@ -603,7 +603,7 @@ public static class CaInventoryReader {
         return rows;
     }
 }
-'@'@
+'@
 
 function Initialize-CaReader {
     if ([type]::GetType('CaInventoryReader')) { return $true }
