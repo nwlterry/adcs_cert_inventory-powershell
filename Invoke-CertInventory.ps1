@@ -133,7 +133,10 @@ function ConvertTo-IsoTime {
     if ($Value -is [double] -or $Value -is [int] -or $Value -is [decimal]) {
         try { return ([datetime]::FromOADate([double]$Value)).ToUniversalTime().ToString('o') } catch { return $null }
     }
-    try { return ([datetimeoffset]::Parse([string]$Value)).UtcDateTime.ToString('o') } catch { return $null }
+    $text = [string]$Value
+    if ($text -match '^(EMPTY|n/?a)$') { return $null }
+    try { return ([datetime]::Parse($text)).ToUniversalTime().ToString('o') } catch { }
+    try { return ([datetimeoffset]::Parse($text)).UtcDateTime.ToString('o') } catch { return $null }
 }
 
 function Test-SystemName {
@@ -148,10 +151,12 @@ function ConvertTo-ByteArray {
     param($Value)
     if ($null -eq $Value) { return $null }
     if ($Value -is [byte[]]) { return ,$Value }
-    if ($Value -is [System.Array] -and $Value.Length -gt 0 -and $Value[0] -is [byte]) {
-        $copy = New-Object byte[] $Value.Length
-        [Array]::Copy($Value, $copy, $Value.Length)
-        return ,$copy
+    if ($Value -is [System.Array] -and $Value.Length -gt 0) {
+        try {
+            $copy = New-Object byte[] $Value.Length
+            for ($i = 0; $i -lt $Value.Length; $i++) { $copy[$i] = [byte]$Value[$i] }
+            return ,$copy
+        } catch { }
     }
     if ($Value -is [string]) {
         $text = $Value.Trim()
@@ -159,6 +164,13 @@ function ConvertTo-ByteArray {
             $text = [regex]::Replace($text, '-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\s', '')
         }
         $text = $text -replace '\s', ''
+        if ($text -match '^[0-9A-Fa-f]+$' -and $text.Length -ge 8 -and ($text.Length % 2) -eq 0) {
+            $hexBytes = New-Object byte[] ($text.Length / 2)
+            for ($i = 0; $i -lt $hexBytes.Length; $i++) {
+                $hexBytes[$i] = [Convert]::ToByte($text.Substring($i * 2, 2), 16)
+            }
+            return ,$hexBytes
+        }
         try { return ,[Convert]::FromBase64String($text) } catch { return $null }
     }
     return $null
@@ -282,18 +294,46 @@ function Test-CaToken {
     return $true
 }
 
+function Release-ComObject {
+    param($Object)
+    if ($null -eq $Object) { return }
+    try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($Object) } catch { }
+}
+
+function Invoke-ViewMethod {
+    param($Object, [string] $Name, [object[]] $Arguments)
+    $flags = [System.Reflection.BindingFlags]::InvokeMethod
+    $type = $Object.GetType()
+    if (-not $PSBoundParameters.ContainsKey('Arguments') -or $null -eq $Arguments -or $Arguments.Count -eq 0) {
+        try { return $type.InvokeMember($Name, $flags, $null, $Object, $null) } catch { }
+        return $type.InvokeMember($Name, $flags, $null, $Object, @())
+    }
+    return $type.InvokeMember($Name, $flags, $null, $Object, ([object[]] $Arguments))
+}
+
 function Get-ColumnRaw {
     param($Column)
     $name = ''
-    try { $name = [string]$Column.GetName() } catch { $name = '' }
-    if ($name -eq 'RawCertificate') {
-        try {
-            $binary = ConvertTo-ByteArray $Column.GetValue($CV_OUT_BINARY)
-            if ($binary) { return $binary }
-        } catch { }
-        try { return (ConvertTo-ByteArray $Column.GetValue($CV_OUT_BASE64)) } catch { return $null }
+    try { $name = [string](Invoke-ViewMethod -Object $Column -Name 'GetName') } catch {
+        try { $name = [string]$Column.GetName() } catch { $name = '' }
     }
-    try { return $Column.GetValue(0) } catch { return $null }
+    $flags = if ($name -eq 'RawCertificate') { @(2, 1, 3, 0) } else { @(0) }
+    foreach ($flag in $flags) {
+        $value = $null
+        try {
+            $value = Invoke-ViewMethod -Object $Column -Name 'GetValue' -Arguments ([object[]] @([int]$flag))
+        } catch {
+            try { $value = $Column.GetValue([int]$flag) } catch { $value = $null }
+        }
+        if ($null -eq $value -or $value -eq '') { continue }
+        if ($name -eq 'RawCertificate') {
+            $binary = ConvertTo-ByteArray $value
+            if ($binary -and $binary.Length -gt 16) { return ,$binary }
+            continue
+        }
+        return $value
+    }
+    return $null
 }
 
 function ConvertTo-Disposition {
@@ -384,71 +424,154 @@ function Resolve-InventoryIps {
 
 function Get-RowsFromView {
     param($Issuer, [datetime] $NotAfterFrom)
-    $view = New-Object -ComObject CertificateAuthority.View
-    $opened = $false
-    foreach ($candidate in @($Issuer.config, ('\\{0}' -f $Issuer.config))) {
-        try {
-            $view.OpenConnection($candidate)
-            $opened = $true
-            break
-        } catch { }
+    $script:ViewIncomplete = $false
+    $view = $null
+    foreach ($progId in @('CertificateAuthority.View.1', 'CertificateAuthority.View')) {
+        try { $view = New-Object -ComObject $progId; break } catch { $view = $null }
     }
-    if (-not $opened) { throw "CertificateAuthority.View could not open '$($Issuer.config)'." }
+    if ($null -eq $view) { throw "CertificateAuthority.View is not registered. Install the Certification Authority tools (certadm.dll)." }
+    $rowset = $null
+    try {
+        $opened = $false
+        foreach ($candidate in @($Issuer.config, ('\\{0}' -f $Issuer.config))) {
+            try {
+                $view.OpenConnection($candidate)
+                $opened = $true
+                break
+            } catch { }
+        }
+        if (-not $opened) { throw "CertificateAuthority.View could not open '$($Issuer.config)'." }
 
-    $wanted = @(
-        'RequestID',
-        'SerialNumber',
-        'Request.RequesterName',
-        'Request.CommonName',
-        'Request.Disposition',
-        'NotBefore',
-        'NotAfter',
-        'CertificateTemplate',
-        'RevokedWhen',
-        'RawCertificate'
-    )
-    $indexes = @()
-    foreach ($name in $wanted) {
-        try {
-            $idx = $view.GetColumnIndex(0, $name)
-            if ($idx -ge 0) { $indexes += [pscustomobject]@{ Name = $name; Index = [int]$idx } }
-        } catch { }
-    }
-    if ($indexes.Count -eq 0) { throw "No readable columns on '$($Issuer.config)'." }
-    $view.SetResultColumnCount($indexes.Count) | Out-Null
-    foreach ($col in $indexes) { $view.SetResultColumn($col.Index) | Out-Null }
-
-    if (-not $IncludeExpired) {
-        try {
-            $notAfterIndex = $view.GetColumnIndex(0, 'NotAfter')
-            if ($notAfterIndex -ge 0) {
-                $view.SetRestriction($notAfterIndex, $CVR_SEEK_GE, 0, $NotAfterFrom.ToLocalTime()) | Out-Null
+        $wanted = @(
+            'RequestID',
+            'SerialNumber',
+            'Request.RequesterName',
+            'Request.CommonName',
+            'Request.Disposition',
+            'NotBefore',
+            'NotAfter',
+            'CertificateTemplate',
+            'RevokedWhen',
+            'RawCertificate'
+        )
+        $indexes = @()
+        foreach ($name in $wanted) {
+            $idx = -1
+            try {
+                $idx = Invoke-ViewMethod -Object $view -Name 'GetColumnIndex' -Arguments ([object[]] @([int]0, [string]$name))
+            } catch {
+                try { $idx = $view.GetColumnIndex(0, $name) } catch { continue }
             }
+            if ([int]$idx -ge 0) { $indexes += [pscustomobject]@{ Name = $name; Index = [int]$idx } }
+        }
+        if ($indexes.Count -eq 0) { throw "No readable columns on '$($Issuer.config)'." }
+        try {
+            Invoke-ViewMethod -Object $view -Name 'SetResultColumnCount' -Arguments ([object[]] @([int]$indexes.Count)) | Out-Null
         } catch {
-            Write-Warning "Could not restrict NotAfter on $($Issuer.config). Filtering in memory."
+            $view.SetResultColumnCount([int]$indexes.Count) | Out-Null
         }
-    }
+        foreach ($col in $indexes) {
+            try {
+                Invoke-ViewMethod -Object $view -Name 'SetResultColumn' -Arguments ([object[]] @([int]$col.Index)) | Out-Null
+            } catch {
+                $view.SetResultColumn([int]$col.Index) | Out-Null
+            }
+        }
 
-    $rowset = $view.OpenView()
-    $records = New-Object System.Collections.Generic.List[object]
-    $guard = 0
-    while ($guard -lt 100000) {
-        $guard++
-        $rowIndex = $rowset.Next()
-        if ($null -eq $rowIndex -or [int]$rowIndex -eq -1) { break }
-        $bag = @{}
-        $column = $rowset.EnumCertViewColumn()
-        while ($true) {
-            $colIndex = $column.Next()
-            if ($null -eq $colIndex -or [int]$colIndex -eq -1) { break }
-            $colName = ''
-            try { $colName = [string]$column.GetName() } catch { continue }
-            $bag[$colName] = Get-ColumnRaw -Column $column
+        # Expiry is filtered in memory. Do not SetRestriction on NotAfter:
+        # passing a DateTime through PowerShell's COM binder throws "Argument types do not match".
+        $null = $NotAfterFrom
+
+        try {
+            $rowset = Invoke-ViewMethod -Object $view -Name 'OpenView'
+        } catch {
+            $rowset = $view.OpenView()
         }
-        $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
-        if ($null -ne $record) { $records.Add($record) }
+        $records = New-Object System.Collections.Generic.List[object]
+        $guard = 0
+        while ($guard -lt 100000) {
+            $guard++
+            $rowIndex = $null
+            try {
+                $rowIndex = Invoke-ViewMethod -Object $rowset -Name 'Next'
+            } catch {
+                try { $rowIndex = $rowset.Next() } catch {
+                    $script:ViewIncomplete = $true
+                    Write-Warning "Stopped reading $($Issuer.config) after $($records.Count) certificates ($($_.Exception.Message))."
+                    break
+                }
+            }
+            if ($null -eq $rowIndex -or [int]$rowIndex -eq -1) { break }
+
+            $column = $null
+            try {
+                try {
+                    $column = Invoke-ViewMethod -Object $rowset -Name 'EnumCertViewColumn'
+                } catch {
+                    $column = $rowset.EnumCertViewColumn()
+                }
+                $bag = @{}
+                while ($true) {
+                    $colIndex = $null
+                    try {
+                        $colIndex = Invoke-ViewMethod -Object $column -Name 'Next'
+                    } catch {
+                        $colIndex = $column.Next()
+                    }
+                    if ($null -eq $colIndex -or [int]$colIndex -eq -1) { break }
+                    $colName = ''
+                    try { $colName = [string](Invoke-ViewMethod -Object $column -Name 'GetName') } catch { continue }
+                    if (-not $colName) { continue }
+                    $bag[$colName] = Get-ColumnRaw -Column $column
+                }
+                $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
+                if ($null -ne $record) { $records.Add($record) }
+            } catch {
+                Write-Warning "Skipped a row on $($Issuer.config) ($($_.Exception.Message))."
+            } finally {
+                # Leaving this enumerator alive makes the next row throw "Argument types do not match".
+                Release-ComObject $column
+            }
+        }
+        return @($records)
+    } finally {
+        Release-ComObject $rowset
+        Release-ComObject $view
     }
-    return @($records)
+}
+
+function New-InventoryCertificate {
+    param($Raw)
+    $bytes = ConvertTo-ByteArray $Raw
+    if ($null -eq $bytes -or $bytes.Length -lt 16) { return $null }
+    if ($bytes[0] -ne 0x30) {
+        $asText = $null
+        try { $asText = [Text.Encoding]::ASCII.GetString($bytes) } catch { $asText = $null }
+        if ($asText) {
+            $decoded = ConvertTo-ByteArray $asText
+            if ($decoded -and $decoded.Length -gt 16 -and $decoded[0] -eq 0x30) { $bytes = $decoded }
+        }
+        if ($bytes[0] -ne 0x30) {
+            $limit = [Math]::Min($bytes.Length - 2, 32)
+            for ($i = 0; $i -lt $limit; $i++) {
+                if ($bytes[$i] -eq 0x30 -and $bytes[$i + 1] -eq 0x82) {
+                    $slice = New-Object byte[] ($bytes.Length - $i)
+                    [Array]::Copy($bytes, $i, $slice, 0, $slice.Length)
+                    $bytes = $slice
+                    break
+                }
+            }
+        }
+    }
+    try {
+        return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$bytes)
+    } catch { }
+    try {
+        $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+        return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($bytes, '', $flags)
+    } catch {
+        return $null
+    }
 }
 
 function ConvertFrom-CaBag {
@@ -474,12 +597,8 @@ function ConvertFrom-CaBag {
     if ($raw) {
         $cert = $null
         try {
-            $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
-            try {
-                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($raw, [NullString]::Value, $flags)
-            } catch {
-                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$raw)
-            }
+            $cert = New-InventoryCertificate -Raw $raw
+            if ($null -eq $cert) { throw "The certificate bytes are not a valid X.509 certificate." }
             $cn = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
             if (-not $cn) { $cn = $requestCn }
             $subject = $cert.Subject
@@ -490,7 +609,7 @@ function ConvertFrom-CaBag {
             $notBefore = $cert.NotBefore.ToUniversalTime().ToString('o')
             $notAfter = $cert.NotAfter.ToUniversalTime().ToString('o')
         } catch {
-            Write-Warning "Request $requestId on $($Issuer.config) could not be parsed as a certificate."
+            Write-Warning "Request $requestId on $($Issuer.config) could not be parsed as a certificate. The database name and dates are kept."
         } finally {
             if ($cert) { $cert.Dispose() }
         }
@@ -509,7 +628,7 @@ function Get-HexDumpBytes {
     param([string] $Block)
     $list = New-Object System.Collections.Generic.List[byte]
     foreach ($line in ($Block -split '\r?\n')) {
-        if ($line -match '^\s+[0-9A-Fa-f]{4}\s{2}((?:[0-9A-Fa-f]{2}\s+)+)') {
+        if ($line -match '^\s+[0-9A-Fa-f]{4}\s+((?:[0-9A-Fa-f]{2}\s*)+)') {
             foreach ($hex in ($Matches[1] -split '\s+' | Where-Object { $_ })) {
                 $list.Add([Convert]::ToByte($hex, 16))
             }
@@ -519,13 +638,78 @@ function Get-HexDumpBytes {
     return ,$list.ToArray()
 }
 
+function Invoke-CertutilText {
+    param([string[]] $ArgumentList)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& certutil.exe @ArgumentList 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return [pscustomobject]@{ ExitCode = $code; Output = ($lines -join "`n") }
+}
+
+function Test-CertutilViewOk {
+    param($Result)
+    if (-not $Result -or -not $Result.Output) { return $false }
+    if ($Result.Output -match 'ERROR_INVALID_FUNCTION|INCORRECT FUNCTION|0x80070001|-view command FAILED') { return $false }
+    if ($Result.Output -match '(?m)^Row \d+:' -or $Result.Output -match 'Request ID:') { return $true }
+    if ($Result.ExitCode -eq 0) { return $true }
+    return $false
+}
+
+function Get-CertutilDecimal {
+    param([string] $Text)
+    if ($Text -match '\((\d+)\)') { return [int]$Matches[1] }
+    if ($Text -match '0x([0-9A-Fa-f]+)') { return [Convert]::ToInt32($Matches[1], 16) }
+    if ($Text -match '(\d+)') { return [int]$Matches[1] }
+    return 0
+}
+
+function Get-CertutilViewOutput {
+    param($Issuer, [string] $ViewName, [string] $Disposition, [string] $Columns)
+    $config = [string]$Issuer.config
+    $attempts = @(
+        @('-config', $config, '-out', $Columns, '-view', $ViewName),
+        @('-config', $config, '-restrict', "Disposition=$Disposition", '-out', $Columns, '-view'),
+        @('-config', $config, '-view', $ViewName, '-out', $Columns),
+        @('-config', $config, '-view', '-restrict', "Disposition=$Disposition", '-out', $Columns)
+    )
+    $last = $null
+    foreach ($attempt in $attempts) {
+        $last = Invoke-CertutilText -ArgumentList $attempt
+        if ($last.Output -match 'ACCESS_DENIED|0x80070005') {
+            throw "certutil was denied on $config. Read permission on the CA is required. $($last.Output)"
+        }
+        if (Test-CertutilViewOk $last) { return $last.Output }
+    }
+    throw "certutil failed for ${config}: $($last.Output)"
+}
+
 function Get-RowsFromCertutil {
     param($Issuer)
+    $columns = 'RequestID,SerialNumber,Request.RequesterName,Request.CommonName,CertificateTemplate,NotBefore,NotAfter,Request.Disposition,RevokedWhen,RawCertificate'
     $blocks = @()
-    foreach ($code in @('Disposition=20', 'Disposition=21')) {
-        $output = & certutil.exe -config $Issuer.config -view -restrict $code -out 'RequestID,SerialNumber,Request.RequesterName,Request.CommonName,CertificateTemplate,NotBefore,NotAfter,Request.Disposition,RevokedWhen,RawCertificate' 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0 -and $output -notmatch 'Row \d+:') {
-            throw "certutil failed for $($Issuer.config): $output"
+    $failedViews = 0
+    $queries = @(
+        @{ View = 'Log'; Disposition = '20' },
+        @{ View = 'Revoked'; Disposition = '21' }
+    )
+    foreach ($query in $queries) {
+        $output = $null
+        try {
+            try {
+                $output = Get-CertutilViewOutput -Issuer $Issuer -ViewName $query.View -Disposition $query.Disposition -Columns $columns
+            } catch {
+                $plain = 'RequestID,SerialNumber,Request.RequesterName,Request.CommonName,CertificateTemplate,NotBefore,NotAfter,Request.Disposition,RevokedWhen'
+                $output = Get-CertutilViewOutput -Issuer $Issuer -ViewName $query.View -Disposition $query.Disposition -Columns $plain
+            }
+        } catch {
+            Write-Warning "certutil $($query.View) view failed on $($Issuer.config). $($_.Exception.Message)"
+            $failedViews++
+            continue
         }
         $parts = [regex]::Split($output, '(?m)^Row \d+:\s*$')
         foreach ($part in $parts) {
@@ -535,12 +719,23 @@ function Get-RowsFromCertutil {
     $records = New-Object System.Collections.Generic.List[object]
     foreach ($block in $blocks) {
         $bag = @{}
-        if ($block -match '(?m)Request ID:\s*"?(\d+)') { $bag['RequestID'] = [int]$Matches[1] }
-        if ($block -match '(?m)Requester Name:\s*(.+)$') { $bag['Request.RequesterName'] = $Matches[1].Trim() }
+        $idLine = if ($block -match '(?m)^.*Request ID:.*$') { $Matches[0] } else { '' }
+        if ($idLine) { $bag['RequestID'] = Get-CertutilDecimal $idLine }
+        if ($block -match '(?m)Requester Name:\s*(.+)$') { $bag['Request.RequesterName'] = $Matches[1].Trim().Trim('"') }
         if ($block -match '(?m)(?:Request Common Name|Common Name):\s*(.+)$') { $bag['Request.CommonName'] = $Matches[1].Trim().Trim('"') }
-        if ($block -match '(?m)Certificate Template:\s*(.+)$') { $bag['CertificateTemplate'] = $Matches[1].Trim() }
+        if ($block -match '(?m)Certificate Template:\s*(.+)$') {
+            $templateLine = $Matches[1].Trim()
+            if ($templateLine -match '\(([^)]+)\)\s*$') { $bag['CertificateTemplate'] = $Matches[1] }
+            else { $bag['CertificateTemplate'] = $templateLine.Trim('"') }
+        }
         if ($block -match '(?m)Serial Number:\s*"?([0-9A-Fa-f ]+)') { $bag['SerialNumber'] = $Matches[1].Trim().Trim('"') }
-        if ($block -match '(?m)Request Disposition:.*?(\d+)') { $bag['Request.Disposition'] = [int]$Matches[1] }
+        if ($block -match '(?m)^.*Request Disposition:.*$') { $bag['Request.Disposition'] = Get-CertutilDecimal $Matches[0] }
+        if ($block -match '(?m)Certificate Effective Date:\s*(.+)$') { $bag['NotBefore'] = $Matches[1].Trim() }
+        if ($block -match '(?m)Certificate Expiration Date:\s*(.+)$') { $bag['NotAfter'] = $Matches[1].Trim() }
+        if ($block -match '(?m)Revocation Date:\s*(.+)$') {
+            $revoked = $Matches[1].Trim()
+            if ($revoked -and $revoked -notmatch '^(EMPTY|n/?a)$') { $bag['RevokedWhen'] = $revoked }
+        }
         $pem = [regex]::Match($block, '-----BEGIN CERTIFICATE-----[\sA-Za-z0-9+/=]+-----END CERTIFICATE-----')
         if ($pem.Success) {
             $bag['RawCertificate'] = $pem.Value
@@ -549,6 +744,9 @@ function Get-RowsFromCertutil {
         }
         $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
         if ($null -ne $record) { $records.Add($record) }
+    }
+    if ($records.Count -eq 0 -and $failedViews -eq $queries.Count) {
+        throw "certutil could not read issued or revoked certificates on $($Issuer.config)."
     }
     return @($records)
 }
@@ -919,23 +1117,32 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Warning "Expected 2 or more issuing CAs for a two-tier PKI. Continuing with $($IssuingCa.Count)."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA. One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
     $certs = New-Object System.Collections.Generic.List[object]
     $errors = New-Object System.Collections.Generic.List[object]
+    $script:ViewIncomplete = $false
     foreach ($issuer in $issuers) {
         Write-Host ("Collecting {0}" -f $issuer.config)
         try {
-            $rows = $null
+            $rows = @()
             $comError = $null
             try {
                 $rows = @(Get-RowsFromView -Issuer $issuer -NotAfterFrom ([datetime]::UtcNow))
             } catch {
                 $comError = $_.Exception.Message
                 Write-Warning "COM view failed ($comError). Falling back to certutil."
-                $rows = @(Get-RowsFromCertutil -Issuer $issuer)
+            }
+            if ($comError -or $script:ViewIncomplete) {
+                try {
+                    $fallback = @(Get-RowsFromCertutil -Issuer $issuer)
+                    if ($fallback.Count -gt 0) { $rows = $fallback }
+                } catch {
+                    if (@($rows).Count -eq 0) { throw }
+                    Write-Warning "certutil fallback failed ($($_.Exception.Message)). Using the $(@($rows).Count) certificates already read."
+                }
             }
             foreach ($row in @($rows)) { if ($null -ne $row) { $certs.Add($row) } }
             Write-Host ("  {0} rows" -f @($rows).Count)
@@ -975,7 +1182,7 @@ $expiring = @($snapshot.certificates | Where-Object {
 
 $path = Write-InventoryJson -Snapshot $snapshot -Path $OutputPath
 Write-Host ''
-Write-Host 'CA Ledger collection'
+Write-Host 'ADCS Certificate Inventory collection'
 Write-Host ("  Root     {0}" -f $snapshot.rootName)
 foreach ($ca in @($snapshot.issuing)) {
     $count = @($snapshot.certificates | Where-Object { $_.issuerName -eq $ca.name -and (Test-InventoryValid -Cert $_ -Now $nowUtc) }).Count
