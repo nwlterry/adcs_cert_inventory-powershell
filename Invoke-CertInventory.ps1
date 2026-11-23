@@ -342,6 +342,8 @@ function ConvertTo-Disposition {
     if ($Value -is [int] -or $Value -is [long] -or $Value -is [decimal]) { $number = [int]$Value }
     else {
         $text = [string]$Value
+        if ($text -match 'Issued') { return 'issued' }
+        if ($text -match 'Revoked') { return 'revoked' }
         if ($text -match '(\d+)') { $number = [int]$Matches[1] }
     }
     if ($number -eq 20 -or $number -eq 3) { return 'issued' }
@@ -401,6 +403,113 @@ function New-InventoryRecord {
     }
 }
 
+$script:CaReaderSource = @'
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Runtime.InteropServices;
+
+public static class CaInventoryReader {
+    const BindingFlags Call = BindingFlags.Instance | BindingFlags.Public | BindingFlags.InvokeMethod;
+
+    static object CallMethod(object com, string name, object[] args) {
+        return com.GetType().InvokeMember(name, Call, null, com, args);
+    }
+
+    public static List<Dictionary<string, object>> Read(string config) {
+        Type kind = Type.GetTypeFromProgID("CertificateAuthority.View");
+        if (kind == null) {
+            throw new InvalidOperationException("CertificateAuthority.View is not registered. Install the Certification Authority tools.");
+        }
+        object view = Activator.CreateInstance(kind);
+        object rowset = null;
+        var rows = new List<Dictionary<string, object>>();
+        try {
+            Exception opened = null;
+            foreach (string candidate in new string[] { config, "\\\\" + config }) {
+                try {
+                    CallMethod(view, "OpenConnection", new object[] { candidate });
+                    opened = null;
+                    break;
+                } catch (Exception ex) {
+                    opened = ex;
+                }
+            }
+            if (opened != null) {
+                throw new InvalidOperationException("Could not open " + config + ". " + opened.GetBaseException().Message, opened);
+            }
+
+            string[] columns = new string[] {
+                "RequestID", "SerialNumber", "Request.RequesterName", "Request.CommonName",
+                "Request.Disposition", "NotBefore", "NotAfter", "CertificateTemplate",
+                "RevokedWhen", "RawCertificate"
+            };
+            var indexes = new List<int>();
+            foreach (string column in columns) {
+                try {
+                    object index = CallMethod(view, "GetColumnIndex", new object[] { 0, column });
+                    int value = Convert.ToInt32(index);
+                    if (value >= 0) indexes.Add(value);
+                } catch {
+                }
+            }
+            if (indexes.Count == 0) throw new InvalidOperationException("No readable columns on " + config + ".");
+            CallMethod(view, "SetResultColumnCount", new object[] { indexes.Count });
+            foreach (int index in indexes) {
+                CallMethod(view, "SetResultColumn", new object[] { index });
+            }
+            rowset = CallMethod(view, "OpenView", null);
+            while (true) {
+                object rowIndex = CallMethod(rowset, "Next", null);
+                if (rowIndex == null || Convert.ToInt32(rowIndex) == -1) break;
+                object column = null;
+                try {
+                    column = CallMethod(rowset, "EnumCertViewColumn", null);
+                    var bag = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                    while (true) {
+                        object colIndex = CallMethod(column, "Next", null);
+                        if (colIndex == null || Convert.ToInt32(colIndex) == -1) break;
+                        string name = "";
+                        try { name = Convert.ToString(CallMethod(column, "GetName", null)); } catch { continue; }
+                        if (string.IsNullOrEmpty(name)) continue;
+                        object value = null;
+                        if (string.Equals(name, "RawCertificate", StringComparison.OrdinalIgnoreCase)) {
+                            try { value = CallMethod(column, "GetValue", new object[] { 2 }); } catch { }
+                            if (value == null) {
+                                try { value = CallMethod(column, "GetValue", new object[] { 1 }); } catch { }
+                            }
+                        } else {
+                            try { value = CallMethod(column, "GetValue", new object[] { 0 }); } catch { }
+                        }
+                        bag[name] = value;
+                    }
+                    rows.Add(bag);
+                } catch {
+                } finally {
+                    if (column != null) {
+                        try { Marshal.ReleaseComObject(column); } catch { }
+                    }
+                }
+            }
+        } finally {
+            if (rowset != null) { try { Marshal.ReleaseComObject(rowset); } catch { } }
+            if (view != null) { try { Marshal.ReleaseComObject(view); } catch { } }
+        }
+        return rows;
+    }
+}
+'@
+
+function Initialize-CaReader {
+    if ([type]::GetType('CaInventoryReader')) { return $true }
+    try {
+        Add-Type -TypeDefinition $script:CaReaderSource -Language CSharp -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Warning "Could not compile the CA reader ($($_.Exception.Message))."
+        return $false
+    }
+}
 $script:DnsCache = @{}
 function Resolve-InventoryIps {
     param([string] $Name)
@@ -424,120 +533,28 @@ function Resolve-InventoryIps {
 
 function Get-RowsFromView {
     param($Issuer, [datetime] $NotAfterFrom)
+    $null = $NotAfterFrom
     $script:ViewIncomplete = $false
-    $view = $null
-    foreach ($progId in @('CertificateAuthority.View.1', 'CertificateAuthority.View')) {
-        try { $view = New-Object -ComObject $progId; break } catch { $view = $null }
+    if (-not (Initialize-CaReader)) {
+        throw "The CA database reader could not be compiled on this host."
     }
-    if ($null -eq $view) { throw "CertificateAuthority.View is not registered. Install the Certification Authority tools (certadm.dll)." }
-    $rowset = $null
-    try {
-        $opened = $false
-        foreach ($candidate in @($Issuer.config, ('\\{0}' -f $Issuer.config))) {
-            try {
-                $view.OpenConnection($candidate)
-                $opened = $true
-                break
-            } catch { }
+    $rows = [CaInventoryReader]::Read([string]$Issuer.config)
+    $records = New-Object System.Collections.Generic.List[object]
+    foreach ($row in @($rows)) {
+        $bag = @{}
+        foreach ($key in @($row.Keys)) {
+            $value = $row[$key]
+            if ($value -is [DBNull]) { $value = $null }
+            $bag[[string]$key] = $value
         }
-        if (-not $opened) { throw "CertificateAuthority.View could not open '$($Issuer.config)'." }
-
-        $wanted = @(
-            'RequestID',
-            'SerialNumber',
-            'Request.RequesterName',
-            'Request.CommonName',
-            'Request.Disposition',
-            'NotBefore',
-            'NotAfter',
-            'CertificateTemplate',
-            'RevokedWhen',
-            'RawCertificate'
-        )
-        $indexes = @()
-        foreach ($name in $wanted) {
-            $idx = -1
-            try {
-                $idx = Invoke-ViewMethod -Object $view -Name 'GetColumnIndex' -Arguments ([object[]] @([int]0, [string]$name))
-            } catch {
-                try { $idx = $view.GetColumnIndex(0, $name) } catch { continue }
-            }
-            if ([int]$idx -ge 0) { $indexes += [pscustomobject]@{ Name = $name; Index = [int]$idx } }
-        }
-        if ($indexes.Count -eq 0) { throw "No readable columns on '$($Issuer.config)'." }
         try {
-            Invoke-ViewMethod -Object $view -Name 'SetResultColumnCount' -Arguments ([object[]] @([int]$indexes.Count)) | Out-Null
+            $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
+            if ($null -ne $record) { $records.Add($record) }
         } catch {
-            $view.SetResultColumnCount([int]$indexes.Count) | Out-Null
+            Write-Warning "Skipped request $($bag['RequestID']) on $($Issuer.config) ($($_.Exception.Message))."
         }
-        foreach ($col in $indexes) {
-            try {
-                Invoke-ViewMethod -Object $view -Name 'SetResultColumn' -Arguments ([object[]] @([int]$col.Index)) | Out-Null
-            } catch {
-                $view.SetResultColumn([int]$col.Index) | Out-Null
-            }
-        }
-
-        # Expiry is filtered in memory. Do not SetRestriction on NotAfter:
-        # passing a DateTime through PowerShell's COM binder throws "Argument types do not match".
-        $null = $NotAfterFrom
-
-        try {
-            $rowset = Invoke-ViewMethod -Object $view -Name 'OpenView'
-        } catch {
-            $rowset = $view.OpenView()
-        }
-        $records = New-Object System.Collections.Generic.List[object]
-        $guard = 0
-        while ($guard -lt 100000) {
-            $guard++
-            $rowIndex = $null
-            try {
-                $rowIndex = Invoke-ViewMethod -Object $rowset -Name 'Next'
-            } catch {
-                try { $rowIndex = $rowset.Next() } catch {
-                    $script:ViewIncomplete = $true
-                    Write-Warning "Stopped reading $($Issuer.config) after $($records.Count) certificates ($($_.Exception.Message))."
-                    break
-                }
-            }
-            if ($null -eq $rowIndex -or [int]$rowIndex -eq -1) { break }
-
-            $column = $null
-            try {
-                try {
-                    $column = Invoke-ViewMethod -Object $rowset -Name 'EnumCertViewColumn'
-                } catch {
-                    $column = $rowset.EnumCertViewColumn()
-                }
-                $bag = @{}
-                while ($true) {
-                    $colIndex = $null
-                    try {
-                        $colIndex = Invoke-ViewMethod -Object $column -Name 'Next'
-                    } catch {
-                        $colIndex = $column.Next()
-                    }
-                    if ($null -eq $colIndex -or [int]$colIndex -eq -1) { break }
-                    $colName = ''
-                    try { $colName = [string](Invoke-ViewMethod -Object $column -Name 'GetName') } catch { continue }
-                    if (-not $colName) { continue }
-                    $bag[$colName] = Get-ColumnRaw -Column $column
-                }
-                $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
-                if ($null -ne $record) { $records.Add($record) }
-            } catch {
-                Write-Warning "Skipped a row on $($Issuer.config) ($($_.Exception.Message))."
-            } finally {
-                # Leaving this enumerator alive makes the next row throw "Argument types do not match".
-                Release-ComObject $column
-            }
-        }
-        return @($records)
-    } finally {
-        Release-ComObject $rowset
-        Release-ComObject $view
     }
+    return @($records)
 }
 
 function New-InventoryCertificate {
@@ -551,26 +568,29 @@ function New-InventoryCertificate {
             $decoded = ConvertTo-ByteArray $asText
             if ($decoded -and $decoded.Length -gt 16 -and $decoded[0] -eq 0x30) { $bytes = $decoded }
         }
-        if ($bytes[0] -ne 0x30) {
-            $limit = [Math]::Min($bytes.Length - 2, 32)
-            for ($i = 0; $i -lt $limit; $i++) {
-                if ($bytes[$i] -eq 0x30 -and $bytes[$i + 1] -eq 0x82) {
-                    $slice = New-Object byte[] ($bytes.Length - $i)
-                    [Array]::Copy($bytes, $i, $slice, 0, $slice.Length)
-                    $bytes = $slice
-                    break
-                }
-            }
-        }
     }
+    if ($null -eq $bytes -or $bytes.Length -lt 16 -or $bytes[0] -ne 0x30) { return $null }
+    # Windows PowerShell binds X509Certificate2's constructors to the wrong overload
+    # and throws "Argument types do not match" for a valid certificate. Import(path) does not.
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ("ca-inv-" + [guid]::NewGuid().ToString("n") + ".cer")
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Stop"
+    $cert = $null
     try {
-        return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$bytes)
-    } catch { }
-    try {
-        $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
-        return New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($bytes, '', $flags)
+        [System.IO.File]::WriteAllBytes($path, [byte[]]$bytes)
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+        $cert.Import($path)
+        return $cert
     } catch {
+        if ($cert) {
+            try { $cert.Dispose() } catch { }
+        }
         return $null
+    } finally {
+        $ErrorActionPreference = $previous
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -627,14 +647,24 @@ function ConvertFrom-CaBag {
 function Get-HexDumpBytes {
     param([string] $Block)
     $list = New-Object System.Collections.Generic.List[byte]
-    foreach ($line in ($Block -split '\r?\n')) {
-        if ($line -match '^\s+[0-9A-Fa-f]{4}\s+((?:[0-9A-Fa-f]{2}\s*)+)') {
-            foreach ($hex in ($Matches[1] -split '\s+' | Where-Object { $_ })) {
-                $list.Add([Convert]::ToByte($hex, 16))
-            }
+    $started = $false
+    foreach ($line in ($Block -split "\r?\n")) {
+        if ($line -match "Binary Certificate|Raw Certificate|RawCertificate") { $started = $true; continue }
+        if (-not $started) { continue }
+        $trim = $line.Trim()
+        if (-not $trim) {
+            if ($list.Count -gt 0) { break }
+            continue
         }
+        if ($trim -match "^[A-Za-z]") { break }
+        $body = $trim
+        if ($body -match "^[0-9A-Fa-f]{4,8}\s{2,}(.+)$") { $body = $Matches[1].Trim() }
+        if ($body -match "^(.*[0-9A-Fa-f]{2})\s{2,}[^0-9A-Fa-f\s].*$") { $body = $Matches[1].Trim() }
+        $tokens = @($body -split "\s+" | Where-Object { $_ -match "^[0-9A-Fa-f]{2}$" })
+        if ($tokens.Count -lt 1) { continue }
+        foreach ($hex in $tokens) { $list.Add([Convert]::ToByte($hex, 16)) }
     }
-    if ($list.Count -eq 0) { return $null }
+    if ($list.Count -lt 16) { return $null }
     return ,$list.ToArray()
 }
 
@@ -742,8 +772,12 @@ function Get-RowsFromCertutil {
         } else {
             $bag['RawCertificate'] = Get-HexDumpBytes -Block $block
         }
-        $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
-        if ($null -ne $record) { $records.Add($record) }
+        try {
+            $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
+            if ($null -ne $record) { $records.Add($record) }
+        } catch {
+            Write-Warning "Skipped request $($bag['RequestID']) on $($Issuer.config) ($($_.Exception.Message))."
+        }
     }
     if ($records.Count -eq 0 -and $failedViews -eq $queries.Count) {
         throw "certutil could not read issued or revoked certificates on $($Issuer.config)."
@@ -1135,7 +1169,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
                 $comError = $_.Exception.Message
                 Write-Warning "COM view failed ($comError). Falling back to certutil."
             }
-            if ($comError -or $script:ViewIncomplete) {
+            if ($comError -or $script:ViewIncomplete -or @($rows).Count -eq 0) {
                 try {
                     $fallback = @(Get-RowsFromCertutil -Issuer $issuer)
                     if ($fallback.Count -gt 0) { $rows = $fallback }
