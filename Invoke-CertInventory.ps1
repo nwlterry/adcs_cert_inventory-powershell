@@ -104,6 +104,13 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$script:CaReaderReady = $false
+$script:CaReaderWarned = $false
+$script:ViewIncomplete = $false
+$script:DnsCache = @{}
+$script:CertUnreadable = 0
+$script:CertReject = ''
+$script:ProbeCache = @{}
 if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $SkipDns = $true
     $IncludeExpired = $false
@@ -274,7 +281,7 @@ function Get-CertificateSerial {
 
 function Split-CaConfig {
     param([string] $Config)
-    $clean = $Config.Trim().TrimStart('\')
+    $clean = $Config.Trim().TrimStart([char]92)
     $parts = $clean -split '\\', 2
     if ($parts.Count -lt 2 -or -not (Test-CaToken -Value $parts[0] -AllowSpace:$false) -or -not (Test-CaToken -Value $parts[1] -AllowSpace:$true)) {
         throw "Issuing CA config must be 'hostname\CA Name'. Got '$Config'."
@@ -651,6 +658,12 @@ function Resolve-InventoryIps {
     return @($ips)
 }
 
+function Get-Unquoted {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    return ([string]$Value).Trim().Trim([char]34).Trim()
+}
+
 function Get-RowsFromView {
     param($Issuer, [datetime] $NotAfterFrom)
     $null = $NotAfterFrom
@@ -893,31 +906,31 @@ function Get-RowsFromCertutil {
     }
     $records = New-Object System.Collections.Generic.List[object]
     foreach ($block in $blocks) {
-        $bag = @{}
-        $idLine = if ($block -match '(?m)^.*Request ID:.*$') { $Matches[0] } else { '' }
-        if ($idLine) { $bag['RequestID'] = Get-CertutilDecimal $idLine }
-        if ($block -match '(?m)Requester Name:\s*(.+)$') { $bag['Request.RequesterName'] = $Matches[1].Trim().Trim('"') }
-        if ($block -match '(?m)(?:Request Common Name|Common Name):\s*(.+)$') { $bag['Request.CommonName'] = $Matches[1].Trim().Trim('"') }
-        if ($block -match '(?m)Certificate Template:\s*(.+)$') {
-            $templateLine = $Matches[1].Trim()
-            if ($templateLine -match '\(([^)]+)\)\s*$') { $bag['CertificateTemplate'] = $Matches[1] }
-            else { $bag['CertificateTemplate'] = $templateLine.Trim('"') }
-        }
-        if ($block -match '(?m)Serial Number:\s*"?([0-9A-Fa-f ]+)') { $bag['SerialNumber'] = $Matches[1].Trim().Trim('"') }
-        if ($block -match '(?m)^.*Request Disposition:.*$') { $bag['Request.Disposition'] = Get-CertutilDecimal $Matches[0] }
-        if ($block -match '(?m)Certificate Effective Date:\s*(.+)$') { $bag['NotBefore'] = $Matches[1].Trim() }
-        if ($block -match '(?m)Certificate Expiration Date:\s*(.+)$') { $bag['NotAfter'] = $Matches[1].Trim() }
-        if ($block -match '(?m)Revocation Date:\s*(.+)$') {
-            $revoked = $Matches[1].Trim()
-            if ($revoked -and $revoked -notmatch '^(EMPTY|n/?a)$') { $bag['RevokedWhen'] = $revoked }
-        }
-        $pem = [regex]::Match($block, '-----BEGIN CERTIFICATE-----[\sA-Za-z0-9+/=]+-----END CERTIFICATE-----')
-        if ($pem.Success) {
-            $bag['RawCertificate'] = $pem.Value
-        } else {
-            $bag['RawCertificate'] = Get-HexDumpBytes -Block $block
-        }
         try {
+            $bag = @{}
+            $idLine = if ($block -match '(?m)^.*Request ID:.*$') { $Matches[0] } else { '' }
+            if ($idLine) { $bag['RequestID'] = Get-CertutilDecimal $idLine }
+            if ($block -match '(?m)Requester Name:\s*(.+)$') { $bag['Request.RequesterName'] = Get-Unquoted $Matches[1] }
+            if ($block -match '(?m)(?:Request Common Name|Common Name):\s*(.+)$') { $bag['Request.CommonName'] = Get-Unquoted $Matches[1] }
+            if ($block -match '(?m)Certificate Template:\s*(.+)$') {
+                $templateLine = Get-Unquoted $Matches[1]
+                if ($templateLine -match '\(([^)]+)\)\s*$') { $bag['CertificateTemplate'] = $Matches[1] }
+                else { $bag['CertificateTemplate'] = $templateLine }
+            }
+            if ($block -match '(?m)Serial Number:\s*"?([0-9A-Fa-f ]+)') { $bag['SerialNumber'] = (Get-Unquoted $Matches[1]) }
+            if ($block -match '(?m)^.*Request Disposition:.*$') { $bag['Request.Disposition'] = Get-CertutilDecimal $Matches[0] }
+            if ($block -match '(?m)Certificate Effective Date:\s*(.+)$') { $bag['NotBefore'] = $Matches[1].Trim() }
+            if ($block -match '(?m)Certificate Expiration Date:\s*(.+)$') { $bag['NotAfter'] = $Matches[1].Trim() }
+            if ($block -match '(?m)Revocation Date:\s*(.+)$') {
+                $revoked = $Matches[1].Trim()
+                if ($revoked -and $revoked -notmatch '^(EMPTY|n/?a)$') { $bag['RevokedWhen'] = $revoked }
+            }
+            $pem = [regex]::Match($block, '-----BEGIN CERTIFICATE-----[\sA-Za-z0-9+/=]+-----END CERTIFICATE-----')
+            if ($pem.Success) {
+                $bag['RawCertificate'] = $pem.Value
+            } else {
+                $bag['RawCertificate'] = Get-HexDumpBytes -Block $block
+            }
             $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
             if ($null -ne $record) { $records.Add($record) }
         } catch {
@@ -1296,7 +1309,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.2). One CA is enough; a two-tier PKI often has more."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.3). One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
