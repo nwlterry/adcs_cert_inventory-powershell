@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CA Ledger</title>
+  <title>ADCS Certificate Inventory</title>
   <style>
     :root {
       color-scheme: dark;
@@ -29,7 +29,7 @@
     p { margin: 0; }
     .row { display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: space-between; align-items: flex-start; }
     .brand { display: flex; gap: 0.75rem; align-items: flex-start; }
-    .mark { width: 2.75rem; height: 2.75rem; display: grid; place-items: center; background: var(--brass); color: var(--brass-fg); font-family: var(--mono); font-size: 0.85rem; border-radius: 0.375rem; flex: none; }
+    .mark { min-width: 2.75rem; height: 2.75rem; padding: 0 0.2rem; display: grid; place-items: center; background: var(--brass); color: var(--brass-fg); font-family: var(--mono); font-size: 0.68rem; letter-spacing: -0.03em; border-radius: 0.375rem; flex: none; }
     .muted { color: var(--muted); }
     .small { font-size: 0.875rem; }
     .tiny { font-size: 0.75rem; }
@@ -71,7 +71,7 @@
   </style>
 </head>
 <body>
-  <main id="app"></main>
+  <main id="app"><p class="small muted" style="padding:1.5rem">Loading inventory…</p></main>
   <script>
     const STATUS_WINDOW_FALLBACK_MS = 5 * 60 * 1000;
     const LABELS = {
@@ -166,7 +166,7 @@
       for (let i = 2; i < arguments.length; i++) {
         const child = arguments[i];
         if (child == null || child === false) continue;
-        node.append(child);
+        node.appendChild(child);
       }
       return node;
     }
@@ -302,15 +302,15 @@
         .sort(function (a, b) { return new Date(a.notAfter) - new Date(b.notAfter); });
       const quiet = rows.filter(function (row) { return row.status !== "active"; }).length;
       const root = document.getElementById("app");
-      root.replaceChildren();
+      while (root.firstChild) root.removeChild(root.firstChild);
 
       const file = el("input", { class: "sr", type: "file", accept: "application/json,.json", change: onPick });
       const where = location.protocol === "file:" ? "Opened from disk" : "Hosted at " + location.host;
-      root.append(el("header", { class: "row" },
+      root.appendChild(el("header", { class: "row" },
         el("div", { class: "brand" },
-          el("span", { class: "mark", text: "CA" }),
+          el("span", { class: "mark", text: "ADCS" }),
           el("div", {},
-            el("h1", { text: "CA Ledger" }),
+            el("h1", { text: "ADCS Certificate Inventory" }),
             el("p", { class: "small muted", text: "On-prem console. Issued certificates are the base. Each CN and SAN is a client of that serial. This page only reads the inventory on this host." }),
             el("p", { class: "tiny muted", text: (state.source === "collector" ? "Live collection" : state.source === "import" ? "Imported collection" : "Sample estate") + " · " + formatWhen(snap.collectedAt) + " · " + (snap.rootName || "") + " · " + where })
           )
@@ -322,40 +322,40 @@
         )
       ));
 
-      if (state.error) root.append(el("p", { class: "card banner small alert", role: "alert", text: state.error }));
+      if (state.error) root.appendChild(el("p", { class: "card banner small alert", role: "alert", text: state.error }));
       (snap.errors || []).forEach(function (item) {
-        root.append(el("p", { class: "card banner small alert", text: (item.config ? item.config + ": " : "") + item.message }));
+        root.appendChild(el("p", { class: "card banner small alert", text: (item.config ? item.config + ": " : "") + item.message }));
       });
 
       const hierarchy = el("section", { class: "hierarchy" });
-      hierarchy.append(el("div", { class: "cell" },
+      hierarchy.appendChild(el("div", { class: "cell" },
         el("p", { class: "tiny muted", text: "Offline root" }),
         el("p", { class: "small", text: snap.rootName || "—" }),
         el("p", { class: "tiny muted", text: "Trust anchor. End-entity certificates are not issued here." })
       ));
       (snap.issuing || []).forEach(function (issuer) {
         const issued = certs.filter(function (cert) { return cert.issuerName === issuer.name; });
-        hierarchy.append(el("div", { class: "cell" },
+        hierarchy.appendChild(el("div", { class: "cell" },
           el("p", { class: "tiny muted", text: "Issuing CA" }),
           el("p", { class: "small break", text: shortCa(issuer.name) }),
           el("p", { class: "tiny muted break", text: issuer.host || issuer.name }),
           el("p", { class: "tiny muted", text: issued.filter(function (cert) { return isValid(cert, now); }).length + " valid · " + issued.filter(function (cert) { return isValid(cert, now) && daysUntil(cert.notAfter, now) <= windowDays; }).length + " expiring" })
         ));
       });
-      root.append(hierarchy);
+      root.appendChild(hierarchy);
 
-      root.append(el("section", { class: "stats" },
+      root.appendChild(el("section", { class: "stats" },
         stat("Issued records", String(certs.length), ""),
         stat("Valid now", String(valid.length), "ok"),
         stat("Expiring in " + windowDays + " days", String(expiring.length), expiring.length ? "warn" : ""),
         stat("Clients not active", String(quiet), quiet ? "warn" : "")
       ));
 
-      root.append(el("p", { class: "card banner small muted", text: "Client status is the collector’s last " + windowMinutes + " minute probe: active, inactive, not in DNS, or not on the network. Several clients may share one certificate. The dashboard does not resolve names and does not leave this network." }));
+      root.appendChild(el("p", { class: "card banner small muted", text: "Client status is the collector’s last " + windowMinutes + " minute probe: active, inactive, not in DNS, or not on the network. Several clients may share one certificate. The dashboard does not resolve names and does not leave this network." }));
 
       const tabs = el("div", { class: "tabs", role: "tablist" });
       [["clients", "Clients " + rows.length], ["inventory", "Inventory"], ["expiring", "Expiring " + expiring.length]].forEach(function (item) {
-        tabs.append(el("button", {
+        tabs.appendChild(el("button", {
           class: "tab" + (state.tab === item[0] ? " on" : ""),
           type: "button",
           role: "tab",
@@ -363,11 +363,11 @@
           click: function () { state.tab = item[0]; render(); }
         }));
       });
-      root.append(tabs);
+      root.appendChild(tabs);
 
-      if (state.tab === "clients") root.append(renderClients(rows, windowMinutes));
-      if (state.tab === "inventory") root.append(renderInventory(certs, now, windowDays));
-      if (state.tab === "expiring") root.append(renderExpiring(expiring, now));
+      if (state.tab === "clients") root.appendChild(renderClients(rows, windowMinutes));
+      if (state.tab === "inventory") root.appendChild(renderInventory(certs, now, windowDays));
+      if (state.tab === "expiring") root.appendChild(renderExpiring(expiring, now));
     }
 
     function stat(label, value, tone) {
@@ -385,31 +385,33 @@
         return [row.client, row.cert.cn, row.cert.serial, row.cert.template, row.address || ""].join(" ").toLowerCase().indexOf(needle) >= 0;
       });
       const wrap = el("section", { class: "stack" });
-      wrap.append(el("p", { class: "small muted", text: "Each block is one certificate serial, then a client taken from its CN or a SAN. Sharing a certificate is not a conflict." }));
+      wrap.appendChild(el("p", { class: "small muted", text: "Each block is one certificate serial, then a client taken from its CN or a SAN. Sharing a certificate is not a conflict." }));
       const filters = el("div", { class: "filters" });
-      filters.append(el("input", {
+      filters.appendChild(el("input", {
         type: "search",
         placeholder: "Certificate, client, or serial",
         value: state.query,
-        const start = event.target.selectionStart;
-      state.query = event.target.value;
-      render();
-      const next = document.querySelector('input[type="search"]');
-      if (next) {
-        next.focus();
-        if (start != null) next.setSelectionRange(start, start);
-      }
+        input: function (event) {
+          const start = event.target.selectionStart;
+          state.query = event.target.value;
+          render();
+          const next = document.querySelector('input[type="search"]');
+          if (next) {
+            next.focus();
+            if (start != null) next.setSelectionRange(start, start);
+          }
+        }
       }));
       FILTERS.forEach(function (item) {
-        filters.append(el("button", {
+        filters.appendChild(el("button", {
           class: "btn" + (state.filter === item ? " on" : ""),
           type: "button",
           text: item === "all" ? "All" : LABELS[item],
           click: function () { state.filter = item; render(); }
         }));
       });
-      wrap.append(filters);
-      if (!visible.length) wrap.append(el("p", { class: "small muted", text: "No clients match." }));
+      wrap.appendChild(filters);
+      if (!visible.length) wrap.appendChild(el("p", { class: "small muted", text: "No clients match." }));
       const groups = [];
       const index = {};
       visible.forEach(function (row) {
@@ -430,7 +432,7 @@
         );
         group.forEach(function (row) {
           const tone = row.status === "active" ? "active" : row.status === "not-checked" ? "muted" : "bad";
-          article.append(el("div", { class: "client" },
+          article.appendChild(el("div", { class: "client" },
             el("div", {},
               el("p", { class: "small break", text: row.client }),
               row.address ? el("p", { class: "tiny mono muted", text: row.address }) : null
@@ -442,7 +444,7 @@
             )
           ));
         });
-        wrap.append(article);
+        wrap.appendChild(article);
       });
       return wrap;
     }
@@ -452,21 +454,21 @@
       certs.slice().sort(function (a, b) { return new Date(a.notAfter) - new Date(b.notAfter); }).forEach(function (cert) {
         const left = daysUntil(cert.notAfter, now);
         const status = cert.disposition === "revoked" ? "Revoked" : left <= 0 ? "Expired" : left <= windowDays ? "Expiring" : "Valid";
-        list.append(el("article", { class: "card banner" },
+        list.appendChild(el("article", { class: "card banner" },
           el("p", { class: "tiny mono muted break", text: formatSerial(cert.serial) }),
           el("h2", { text: cert.cn }),
           el("p", { class: "tiny muted", text: status + " · " + cert.template + " · " + shortCa(cert.issuerName) + " · " + formatWhen(cert.notAfter) })
         ));
       });
-      if (!certs.length) list.append(el("p", { class: "small muted", text: "No certificates in this file." }));
+      if (!certs.length) list.appendChild(el("p", { class: "small muted", text: "No certificates in this file." }));
       return list;
     }
 
     function renderExpiring(certs, now) {
       const list = el("section", { class: "stack" });
-      if (!certs.length) list.append(el("p", { class: "small muted", text: "Nothing in the expiry window." }));
+      if (!certs.length) list.appendChild(el("p", { class: "small muted", text: "Nothing in the expiry window." }));
       certs.forEach(function (cert) {
-        list.append(el("article", { class: "card banner" },
+        list.appendChild(el("article", { class: "card banner" },
           el("p", { class: "small bad", text: daysUntil(cert.notAfter, now) + " days" }),
           el("h2", { text: cert.cn }),
           el("p", { class: "tiny muted", text: formatSerial(cert.serial) + " · " + shortCa(cert.issuerName) })
