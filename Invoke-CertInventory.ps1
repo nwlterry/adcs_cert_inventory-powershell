@@ -413,36 +413,329 @@ function New-InventoryRecord {
 $script:CaReaderSource = @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
-using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.RegularExpressions;
 
-public static class CaLedgerReader {
-    const BindingFlags Call = BindingFlags.Instance | BindingFlags.Public | BindingFlags.InvokeMethod;
-
-    static object CallMethod(object com, string name, object[] args) {
-        return com.GetType().InvokeMember(name, Call, null, com, args);
+public static class CaLedgerReader034 {
+    public static string Collect(string config, bool includeExpired) {
+        if (string.IsNullOrEmpty(config)) throw new InvalidOperationException("CA config is empty.");
+        string issued = Query(config, "20", false);
+        string revoked = Query(config, "21", true);
+        int unreadable = 0;
+        var lines = new List<string>();
+        unreadable += AppendRows(lines, issued, includeExpired);
+        unreadable += AppendRows(lines, revoked, includeExpired);
+        if (lines.Count == 0) {
+            string sample = Sample(issued);
+            if (sample.Length == 0) sample = Sample(revoked);
+            throw new InvalidOperationException("certutil returned no issued certificates for " + config + ". " + sample);
+        }
+        var text = new StringBuilder();
+        if (unreadable > 0) {
+            text.Append("WARN ");
+            text.Append(unreadable.ToString(CultureInfo.InvariantCulture));
+            text.Append(" certificate bodies could not be decoded. Database name and dates were kept.");
+            text.Append('\n');
+        }
+        foreach (string line in lines) text.Append(line).Append('\n');
+        return text.ToString();
     }
 
-    static bool IsHex(string text) {
-        if (string.IsNullOrEmpty(text) || (text.Length % 2) != 0) return false;
-        for (int i = 0; i < text.Length; i++) {
-            char c = text[i];
-            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-            if (!hex) return false;
+    public static string Resolve(string name) {
+        if (string.IsNullOrEmpty(name)) return "";
+        try {
+            var ips = System.Net.Dns.GetHostAddresses(name);
+            var list = new List<string>();
+            foreach (var ip in ips) {
+                if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) continue;
+                string text = ip.ToString();
+                if (IsUnicast(text) && !list.Contains(text)) list.Add(text);
+            }
+            return string.Join(",", list.ToArray());
+        } catch {
+            return "";
         }
-        return true;
+    }
+
+    static bool IsUnicast(string ip) {
+        string[] parts = ip.Split('.');
+        if (parts.Length != 4) return false;
+        int first;
+        if (!int.TryParse(parts[0], out first)) return false;
+        return first > 0 && first < 224;
+    }
+
+    static string Query(string config, string disposition, bool revokedView) {
+        string cols = "RequestID,SerialNumber,Request.RequesterName,Request.CommonName,CertificateTemplate,NotBefore,NotAfter,Request.Disposition,RevokedWhen,RawCertificate";
+        string view = revokedView ? "Revoked" : "Log";
+        string[] attempts = new string[] {
+            "-config " + Quote(config) + " -restrict " + Quote("Disposition=" + disposition) + " -out " + Quote(cols),
+            "-config " + Quote(config) + " -restrict " + Quote("Disposition=" + disposition) + " -out " + Quote(cols) + " -view " + view,
+            "-config " + Quote(config) + " -out " + Quote(cols) + " -view " + view,
+            "-config " + Quote(config) + " -view " + view + " -restrict " + Quote("Disposition=" + disposition) + " -out " + Quote(cols)
+        };
+        string best = "";
+        int bestScore = 0;
+        foreach (string attempt in attempts) {
+            string output;
+            try { output = RunCertutil(attempt); }
+            catch { continue; }
+            if (output.IndexOf("ACCESS_DENIED", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                output.IndexOf("0x80070005", StringComparison.OrdinalIgnoreCase) >= 0) {
+                throw new InvalidOperationException("certutil was denied on " + config + ". Read permission on the CA is required.");
+            }
+            int score = Score(output);
+            if (score > bestScore) {
+                bestScore = score;
+                best = output;
+                if (score >= 1) break;
+            }
+        }
+        return best ?? "";
+    }
+
+    static int Score(string text) {
+        if (string.IsNullOrEmpty(text)) return 0;
+        if (text.IndexOf("ERROR_INVALID_FUNCTION", StringComparison.OrdinalIgnoreCase) >= 0) return 0;
+        if (text.IndexOf("INCORRECT FUNCTION", StringComparison.OrdinalIgnoreCase) >= 0) return 0;
+        int rows = Regex.Matches(text, "(?m)^Row \\d+:").Count;
+        int ids = Regex.Matches(text, "Request ID:").Count;
+        return Math.Max(rows, ids);
+    }
+
+    static string RunCertutil(string arguments) {
+        ProcessStartInfo psi = new ProcessStartInfo();
+        psi.FileName = "certutil.exe";
+        psi.Arguments = arguments;
+        psi.UseShellExecute = false;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.CreateNoWindow = true;
+        Process proc = new Process();
+        proc.StartInfo = psi;
+        try {
+            proc.Start();
+        } catch (Exception ex) {
+            throw new InvalidOperationException("certutil.exe could not be started. " + ex.Message);
+        }
+        string stdout = proc.StandardOutput.ReadToEnd();
+        string stderr = proc.StandardError.ReadToEnd();
+        if (!proc.WaitForExit(300000)) {
+            try { proc.Kill(); } catch { }
+            throw new InvalidOperationException("certutil timed out.");
+        }
+        return (stdout ?? "") + "\n" + (stderr ?? "");
+    }
+
+    static string Quote(string value) {
+        return "\"" + (value ?? "").Replace("\"", "") + "\"";
+    }
+
+    static string Sample(string text) {
+        if (string.IsNullOrEmpty(text)) return "certutil produced no output.";
+        string flat = Regex.Replace(text, "\\s+", " ").Trim();
+        if (flat.Length > 280) flat = flat.Substring(0, 280);
+        return flat;
+    }
+
+    static int AppendRows(List<string> lines, string output, bool includeExpired) {
+        if (string.IsNullOrEmpty(output)) return 0;
+        int unreadable = 0;
+        string[] blocks = Regex.Split(output, "(?m)^Row \\d+:\\s*");
+        foreach (string block in blocks) {
+            if (block.IndexOf("Request ID:", StringComparison.OrdinalIgnoreCase) < 0) continue;
+            string dispositionText = First(block, new string[] { "Request Disposition", "Certificate Disposition", "Disposition" });
+            string disposition = DispositionOf(dispositionText);
+            if (disposition.Length == 0) continue;
+            string requestId = RequestIdOf(First(block, new string[] { "Request ID" }));
+            string serial = CleanSerial(First(block, new string[] { "Serial Number" }));
+            string cn = Unquote(First(block, new string[] { "Request Common Name", "Issued Common Name", "Common Name" }));
+            string template = Unquote(First(block, new string[] { "Certificate Template" }));
+            string requester = Unquote(First(block, new string[] { "Requester Name" }));
+            string notBefore = Iso(First(block, new string[] { "Certificate Effective Date", "NotBefore" }));
+            string notAfter = Iso(First(block, new string[] { "Certificate Expiration Date", "NotAfter" }));
+            string revoked = Iso(First(block, new string[] { "Revocation Date", "Revoked When" }));
+            string subject = "";
+            string san = "";
+            string payload = ExtractPayload(block);
+            if (payload.Length > 0) {
+                Dictionary<string, string> described = Describe(payload);
+                if (described == null) unreadable++;
+                else {
+                    if (described["CommonName"].Length > 0) cn = described["CommonName"];
+                    if (described["Serial"].Length > 0) serial = CleanSerial(described["Serial"]);
+                    if (described["NotBefore"].Length > 0) notBefore = described["NotBefore"];
+                    if (described["NotAfter"].Length > 0) notAfter = described["NotAfter"];
+                    if (described["Subject"].Length > 0) subject = described["Subject"];
+                    if (described["Template"].Length > 0) template = described["Template"];
+                    san = described["San"];
+                }
+            } else {
+                unreadable++;
+            }
+            if (cn.Length == 0 || notBefore.Length == 0 || notAfter.Length == 0) continue;
+            if (!includeExpired && disposition == "issued") {
+                DateTimeOffset expiry;
+                if (DateTimeOffset.TryParse(notAfter, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out expiry)) {
+                    if (expiry.UtcDateTime <= DateTime.UtcNow) continue;
+                }
+            }
+            lines.Add(string.Join("\t", new string[] {
+                Cell(requestId), Cell(serial), Cell(cn), Cell(subject), Cell(template),
+                Cell(requester), Cell(notBefore), Cell(notAfter), Cell(disposition), Cell(revoked), Cell(san)
+            }));
+        }
+        return unreadable;
+    }
+
+    static string First(string block, string[] labels) {
+        foreach (string label in labels) {
+            Match match = Regex.Match(block, "(?im)^.*" + Regex.Escape(label) + "\\s*:\\s*(.+)$");
+            if (match.Success) return match.Groups[1].Value.Trim();
+        }
+        return "";
+    }
+
+    static string Unquote(string value) {
+        if (string.IsNullOrEmpty(value)) return "";
+        string text = value.Trim();
+        if (text.Length >= 2 && text[0] == '"' && text[text.Length - 1] == '"') text = text.Substring(1, text.Length - 2);
+        return text.Trim();
+    }
+
+    static string RequestIdOf(string text) {
+        if (string.IsNullOrEmpty(text)) return "0";
+        Match paren = Regex.Match(text, "\\((\\d+)\\)");
+        if (paren.Success) return paren.Groups[1].Value;
+        Match hex = Regex.Match(text, "0x([0-9A-Fa-f]+)");
+        if (hex.Success) return Convert.ToInt32(hex.Groups[1].Value, 16).ToString(CultureInfo.InvariantCulture);
+        Match number = Regex.Match(text, "(\\d+)");
+        if (number.Success) return number.Groups[1].Value;
+        return "0";
+    }
+
+    static string DispositionOf(string text) {
+        if (string.IsNullOrEmpty(text)) return "";
+        if (text.IndexOf("Revoked", StringComparison.OrdinalIgnoreCase) >= 0) return "revoked";
+        if (text.IndexOf("Issued", StringComparison.OrdinalIgnoreCase) >= 0 && text.IndexOf("Pending", StringComparison.OrdinalIgnoreCase) < 0) return "issued";
+        int number = -1;
+        Match paren = Regex.Match(text, "\\((\\d+)\\)");
+        if (paren.Success) number = int.Parse(paren.Groups[1].Value, CultureInfo.InvariantCulture);
+        else {
+            Match numberMatch = Regex.Match(text, "(\\d+)");
+            if (numberMatch.Success) number = int.Parse(numberMatch.Groups[1].Value, CultureInfo.InvariantCulture);
+        }
+        if (number == 20) return "issued";
+        if (number == 21) return "revoked";
+        return "";
+    }
+
+    static string CleanSerial(string text) {
+        if (string.IsNullOrEmpty(text)) return "0";
+        var sb = new StringBuilder();
+        foreach (char c in text) {
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) sb.Append(char.ToLowerInvariant(c));
+        }
+        string hex = sb.ToString().TrimStart('0');
+        return hex.Length == 0 ? "0" : hex;
+    }
+
+    static string Iso(string text) {
+        text = Unquote(text);
+        if (text.Length == 0) return "";
+        if (text.Equals("EMPTY", StringComparison.OrdinalIgnoreCase)) return "";
+        DateTime when;
+        if (DateTime.TryParse(text, CultureInfo.CurrentCulture, DateTimeStyles.AssumeLocal, out when) ||
+            DateTime.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out when)) {
+            if (when.Kind == DateTimeKind.Unspecified) when = DateTime.SpecifyKind(when, DateTimeKind.Local);
+            return when.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+        }
+        return "";
+    }
+
+    static string Cell(string value) {
+        if (string.IsNullOrEmpty(value)) return "";
+        return value.Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
+    }
+
+    static string ExtractPayload(string block) {
+        int begin = block.IndexOf("BEGIN CERTIFICATE", StringComparison.OrdinalIgnoreCase);
+        if (begin >= 0) {
+            int end = block.IndexOf("END CERTIFICATE", StringComparison.OrdinalIgnoreCase);
+            if (end > begin) return block.Substring(begin, (end - begin) + "END CERTIFICATE".Length);
+        }
+        var hex = new StringBuilder();
+        bool started = false;
+        string[] lines = block.Split(new char[] { '\n' });
+        foreach (string raw in lines) {
+            string line = raw.Trim();
+            if (line.IndexOf("Binary Certificate", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                line.IndexOf("Raw Certificate", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                line.IndexOf("RawCertificate", StringComparison.OrdinalIgnoreCase) >= 0) {
+                started = true;
+                continue;
+            }
+            if (!started) continue;
+            if (line.Length == 0) {
+                if (hex.Length > 0) break;
+                continue;
+            }
+            string body = line;
+            Match offset = Regex.Match(body, "^[0-9A-Fa-f]{4,8}\\s{2,}(.+)$");
+            if (offset.Success) body = offset.Groups[1].Value.Trim();
+            Match gutter = Regex.Match(body, "^(.*[0-9A-Fa-f]{2})\\s{2,}[^0-9A-Fa-f\\s].*$");
+            if (gutter.Success) body = gutter.Groups[1].Value.Trim();
+            int before = hex.Length;
+            foreach (string token in body.Split(new char[] { ' ', '\t' })) {
+                if (token.Length == 2 && IsHexPair(token)) hex.Append(token);
+            }
+            if (hex.Length == before) {
+                if (hex.Length > 0) break;
+            }
+        }
+        return hex.Length >= 32 ? hex.ToString() : "";
+    }
+
+    static bool IsHexPair(string token) {
+        if (token == null || token.Length != 2) return false;
+        return Uri.IsHexDigit(token[0]) && Uri.IsHexDigit(token[1]);
+    }
+
+    static Dictionary<string, string> Describe(string payload) {
+        byte[] der = Decode(payload);
+        if (der == null || der.Length < 16 || der[0] != 0x30) return null;
+        try {
+            X509Certificate2 cert = new X509Certificate2(der);
+            var bag = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            bag["CommonName"] = cert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
+            bag["Subject"] = cert.Subject ?? "";
+            bag["Serial"] = cert.SerialNumber ?? "";
+            bag["NotBefore"] = cert.NotBefore.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+            bag["NotAfter"] = cert.NotAfter.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+            string san = "";
+            string template = "";
+            foreach (X509Extension ext in cert.Extensions) {
+                string oid = ext.Oid == null ? "" : ext.Oid.Value;
+                if (oid == "2.5.29.17" && ext.RawData != null) san = Convert.ToBase64String(ext.RawData);
+                if (oid == "1.3.6.1.4.1.311.20.2" || oid == "1.3.6.1.4.1.311.21.7") {
+                    try { template = ext.Format(false); } catch { }
+                }
+            }
+            bag["San"] = san ?? "";
+            bag["Template"] = template ?? "";
+            return bag;
+        } catch {
+            return null;
+        }
     }
 
     static byte[] Decode(string payload) {
         if (string.IsNullOrEmpty(payload)) return null;
         string text = payload.Trim();
-        int begin = text.IndexOf("BEGIN CERTIFICATE", StringComparison.OrdinalIgnoreCase);
-        if (begin >= 0) {
-            int start = text.IndexOf("-----", begin + 10);
-            // header is -----BEGIN CERTIFICATE----- ; drop both markers
+        if (text.IndexOf("BEGIN CERTIFICATE", StringComparison.OrdinalIgnoreCase) >= 0) {
             text = text.Replace("-----BEGIN CERTIFICATE-----", "");
             text = text.Replace("-----END CERTIFICATE-----", "");
         }
@@ -468,153 +761,22 @@ public static class CaLedgerReader {
         }
     }
 
-    public static Dictionary<string, string> Describe(string payload) {
-        byte[] der = Decode(payload);
-        if (der == null || der.Length < 16 || der[0] != 0x30) return null;
-        X509Certificate2 cert = new X509Certificate2(der);
-        var bag = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        bag["CommonName"] = cert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
-        bag["Subject"] = cert.Subject ?? "";
-        bag["Serial"] = cert.SerialNumber ?? "";
-        bag["NotBefore"] = cert.NotBefore.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
-        bag["NotAfter"] = cert.NotAfter.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
-        string san = "";
-        string template = "";
-        foreach (X509Extension ext in cert.Extensions) {
-            string oid = ext.Oid == null ? "" : ext.Oid.Value;
-            if (oid == "2.5.29.17" && ext.RawData != null) san = Convert.ToBase64String(ext.RawData);
-            if (oid == "1.3.6.1.4.1.311.20.2" || oid == "1.3.6.1.4.1.311.21.7") {
-                try { template = ext.Format(false); } catch { }
-            }
+    static bool IsHex(string text) {
+        if (string.IsNullOrEmpty(text) || (text.Length % 2) != 0) return false;
+        for (int i = 0; i < text.Length; i++) {
+            char c = text[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
         }
-        bag["San"] = san ?? "";
-        bag["Template"] = template ?? "";
-        return bag;
-    }
-
-    static string Box(object value) {
-        if (value == null || value is DBNull) return "";
-        byte[] raw = value as byte[];
-        if (raw != null) return Convert.ToBase64String(raw);
-        if (value is DateTime) {
-            DateTime when = (DateTime)value;
-            if (when.Kind == DateTimeKind.Unspecified) when = DateTime.SpecifyKind(when, DateTimeKind.Local);
-            return when.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
-        }
-        Array array = value as Array;
-        if (array != null && !(value is string)) {
-            try {
-                var bytes = new byte[array.Length];
-                bool allBytes = true;
-                for (int i = 0; i < array.Length; i++) {
-                    object item = array.GetValue(i);
-                    if (item is byte) bytes[i] = (byte)item;
-                    else { allBytes = false; break; }
-                }
-                if (allBytes && bytes.Length > 0) return Convert.ToBase64String(bytes);
-            } catch { }
-        }
-        return Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
-    }
-
-    public static List<Dictionary<string, string>> Read(string config) {
-        Type kind = Type.GetTypeFromProgID("CertificateAuthority.View");
-        if (kind == null) {
-            throw new InvalidOperationException("CertificateAuthority.View is not registered. Install the Certification Authority tools.");
-        }
-        object view = Activator.CreateInstance(kind);
-        object rowset = null;
-        var rows = new List<Dictionary<string, string>>();
-        try {
-            Exception opened = null;
-            string[] candidates = new string[] { config, "\\\\" + config };
-            foreach (string candidate in candidates) {
-                try {
-                    CallMethod(view, "OpenConnection", new object[] { candidate });
-                    opened = null;
-                    break;
-                } catch (Exception ex) {
-                    opened = ex;
-                }
-            }
-            if (opened != null) {
-                throw new InvalidOperationException("Could not open " + config + ". " + opened.GetBaseException().Message, opened);
-            }
-
-            string[] columns = new string[] {
-                "RequestID", "SerialNumber", "Request.RequesterName", "Request.CommonName",
-                "Request.Disposition", "NotBefore", "NotAfter", "CertificateTemplate",
-                "RevokedWhen", "RawCertificate"
-            };
-            var indexes = new List<int>();
-            foreach (string column in columns) {
-                try {
-                    object index = CallMethod(view, "GetColumnIndex", new object[] { 0, column });
-                    int value = Convert.ToInt32(index);
-                    if (value >= 0) indexes.Add(value);
-                } catch { }
-            }
-            if (indexes.Count == 0) throw new InvalidOperationException("No readable columns on " + config + ".");
-            CallMethod(view, "SetResultColumnCount", new object[] { indexes.Count });
-            foreach (int index in indexes) CallMethod(view, "SetResultColumn", new object[] { index });
-            rowset = CallMethod(view, "OpenView", null);
-            while (true) {
-                object rowIndex;
-                try { rowIndex = CallMethod(rowset, "Next", null); }
-                catch { break; }
-                if (rowIndex == null || Convert.ToInt32(rowIndex) == -1) break;
-                object column = null;
-                try {
-                    column = CallMethod(rowset, "EnumCertViewColumn", null);
-                    var bag = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                    while (true) {
-                        object colIndex;
-                        try { colIndex = CallMethod(column, "Next", null); }
-                        catch { break; }
-                        if (colIndex == null || Convert.ToInt32(colIndex) == -1) break;
-                        string name = "";
-                        try { name = Convert.ToString(CallMethod(column, "GetName", null)); } catch { continue; }
-                        if (string.IsNullOrEmpty(name)) continue;
-                        object value = null;
-                        if (string.Equals(name, "RawCertificate", StringComparison.OrdinalIgnoreCase)) {
-                            try { value = CallMethod(column, "GetValue", new object[] { 2 }); } catch { }
-                            if (value == null) {
-                                try { value = CallMethod(column, "GetValue", new object[] { 1 }); } catch { }
-                            }
-                            string encoded = Box(value);
-                            if (!string.IsNullOrEmpty(encoded)) {
-                                try {
-                                    Dictionary<string, string> described = Describe(encoded);
-                                    if (described != null) {
-                                        foreach (KeyValuePair<string, string> pair in described) bag["Parsed" + pair.Key] = pair.Value ?? "";
-                                    }
-                                } catch { }
-                            }
-                        } else {
-                            try { value = CallMethod(column, "GetValue", new object[] { 0 }); } catch { }
-                            bag[name] = Box(value);
-                        }
-                    }
-                    rows.Add(bag);
-                } catch {
-                } finally {
-                    if (column != null) {
-                        try { Marshal.ReleaseComObject(column); } catch { }
-                    }
-                }
-            }
-        } finally {
-            if (rowset != null) { try { Marshal.ReleaseComObject(rowset); } catch { } }
-            if (view != null) { try { Marshal.ReleaseComObject(view); } catch { } }
-        }
-        return rows;
+        return true;
     }
 }
 '@
 
+
 function Initialize-CaReader {
     if ($script:CaReaderReady) { return $true }
-    if ('CaLedgerReader' -as [type]) {
+    if ('CaLedgerReader034' -as [type]) {
         $script:CaReaderReady = $true
         return $true
     }
@@ -623,7 +785,7 @@ function Initialize-CaReader {
         $script:CaReaderReady = $true
         return $true
     } catch {
-        if (($_.Exception.Message -match 'already exists') -and ('CaLedgerReader' -as [type])) {
+        if (($_.Exception.Message -match 'already exists') -and ('CaLedgerReader034' -as [type])) {
             $script:CaReaderReady = $true
             return $true
         }
@@ -671,12 +833,41 @@ function Get-RowsFromView {
     if (-not (Initialize-CaReader)) {
         throw "The CA database reader could not be compiled on this host."
     }
-    $rows = [CaLedgerReader]::Read([string]$Issuer.config)
+    $kept = [bool]$IncludeExpired
+    $text = [CaLedgerReader034]::Collect([string]$Issuer.config, $kept)
+    if (-not $text) { return @() }
     $records = New-Object System.Collections.Generic.List[object]
-    foreach ($row in @($rows)) {
+    foreach ($line in ($text -split "\r?\n")) {
+        if (-not $line) { continue }
+        if ($line -like 'WARN *') {
+            if (-not $script:CertReject) { $script:CertReject = $line }
+            continue
+        }
         try {
-            $bag = @{}
-            foreach ($key in @($row.Keys)) { $bag[[string]$key] = [string]$row[$key] }
+            $f = @($line -split "`t")
+            if ($f.Count -lt 9) { continue }
+            $san = ''
+            $revoked = ''
+            if ($f.Count -gt 9) { $revoked = [string]$f[9] }
+            if ($f.Count -gt 10) { $san = [string]$f[10] }
+            $bag = @{
+                'RequestID'            = [string]$f[0]
+                'ParsedSerial'         = [string]$f[1]
+                'ParsedCommonName'     = [string]$f[2]
+                'ParsedSubject'        = [string]$f[3]
+                'ParsedTemplate'       = [string]$f[4]
+                'Request.RequesterName' = [string]$f[5]
+                'ParsedNotBefore'      = [string]$f[6]
+                'ParsedNotAfter'       = [string]$f[7]
+                'Request.Disposition'  = [string]$f[8]
+                'RevokedWhen'          = $revoked
+                'ParsedSan'            = $san
+                'Request.CommonName'   = [string]$f[2]
+                'SerialNumber'         = [string]$f[1]
+                'NotBefore'            = [string]$f[6]
+                'NotAfter'             = [string]$f[7]
+                'CertificateTemplate'  = [string]$f[4]
+            }
             $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
             if ($null -ne $record) { $records.Add($record) }
         } catch {
@@ -1309,7 +1500,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.3). One CA is enough; a two-tier PKI often has more."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.4). One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
@@ -1320,20 +1511,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
         Write-Host ("Collecting {0}" -f $issuer.config)
         try {
             $rows = @()
-            $comError = $null
             try {
                 $rows = @(Get-RowsFromView -Issuer $issuer -NotAfterFrom ([datetime]::UtcNow))
             } catch {
-                $comError = $_.Exception.Message
-                Write-Warning "COM view failed ($comError). Falling back to certutil."
-            }
-            if ($comError -or $script:ViewIncomplete -or @($rows).Count -eq 0) {
-                try {
-                    $fallback = @(Get-RowsFromCertutil -Issuer $issuer)
-                    if ($fallback.Count -gt 0) { $rows = $fallback }
-                } catch {
-                    Write-Warning "certutil fallback failed ($($_.Exception.Message))."
-                }
+                Write-Warning "Collection failed ($($_.Exception.Message))."
+                if (-not $script:CertReject) { $script:CertReject = $_.Exception.Message }
             }
             foreach ($row in @($rows)) { if ($null -ne $row) { $certs.Add($row) } }
             Write-Host ("  {0} rows" -f @($rows).Count)
