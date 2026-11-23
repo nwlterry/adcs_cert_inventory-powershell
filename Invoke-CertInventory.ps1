@@ -412,7 +412,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
-public static class CaInventoryReader {
+public static class CaLedgerReader {
     const BindingFlags Call = BindingFlags.Instance | BindingFlags.Public | BindingFlags.InvokeMethod;
 
     static object CallMethod(object com, string name, object[] args) {
@@ -606,12 +606,24 @@ public static class CaInventoryReader {
 '@
 
 function Initialize-CaReader {
-    if ([type]::GetType('CaInventoryReader')) { return $true }
+    if ($script:CaReaderReady) { return $true }
+    if ('CaLedgerReader' -as [type]) {
+        $script:CaReaderReady = $true
+        return $true
+    }
     try {
         Add-Type -TypeDefinition $script:CaReaderSource -Language CSharp -ErrorAction Stop
+        $script:CaReaderReady = $true
         return $true
     } catch {
-        Write-Warning "Could not compile the CA reader ($($_.Exception.Message))."
+        if (($_.Exception.Message -match 'already exists') -and ('CaLedgerReader' -as [type])) {
+            $script:CaReaderReady = $true
+            return $true
+        }
+        if (-not $script:CaReaderWarned) {
+            Write-Warning "Could not compile the CA reader ($($_.Exception.Message))."
+            $script:CaReaderWarned = $true
+        }
         return $false
     }
 }
@@ -646,7 +658,7 @@ function Get-RowsFromView {
     if (-not (Initialize-CaReader)) {
         throw "The CA database reader could not be compiled on this host."
     }
-    $rows = [CaInventoryReader]::Read([string]$Issuer.config)
+    $rows = [CaLedgerReader]::Read([string]$Issuer.config)
     $records = New-Object System.Collections.Generic.List[object]
     foreach ($row in @($rows)) {
         try {
@@ -744,7 +756,7 @@ function ConvertFrom-CaBag {
         }
         $info = $null
         if ($payload -and (Initialize-CaReader)) {
-            try { $info = [CaInventoryReader]::Describe([string]$payload) } catch {
+            try { $info = [CaLedgerReader]::Describe([string]$payload) } catch {
                 if (-not $script:CertReject) { $script:CertReject = $_.Exception.GetBaseException().Message }
             }
         }
@@ -1284,7 +1296,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.1). One CA is enough; a two-tier PKI often has more."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.2). One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
