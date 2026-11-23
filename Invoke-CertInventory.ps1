@@ -111,6 +111,8 @@ $script:DnsCache = @{}
 $script:CertUnreadable = 0
 $script:CertReject = ''
 $script:RowReject = ''
+$script:KeptRows = 0
+$script:CollectedRows = @()
 $script:ProbeCache = @{}
 if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $SkipDns = $true
@@ -376,22 +378,22 @@ function New-InventoryRecord {
         [string] $RevokedWhen,
         $Sans
     )
-    $resolved = New-Object System.Collections.Generic.List[object]
+    $resolved = @()
     $ipSans = @($Sans | Where-Object { $_.type -eq 'ip' } | ForEach-Object { [string]$_.value })
-    $names = New-Object System.Collections.Generic.List[object]
-    if (Test-SystemName $CommonName) { $names.Add([ordered]@{ name = $CommonName; from = 'cn' }) }
+    $names = @()
+    if (Test-SystemName $CommonName) { $names += [ordered]@{ name = $CommonName; from = 'cn' } }
     foreach ($san in @($Sans)) {
         if ($san.type -eq 'dns' -and (Test-SystemName $san.value) -and $san.value.ToLowerInvariant() -ne $CommonName.ToLowerInvariant()) {
-            $names.Add([ordered]@{ name = [string]$san.value; from = 'san' })
+            $names += [ordered]@{ name = [string]$san.value; from = 'san' }
         }
     }
-    foreach ($entry in $names) {
+    foreach ($entry in @($names)) {
         $ips = @()
         if (-not $SkipDns) {
             $ips = @(Resolve-InventoryIps -Name $entry.name)
         }
         if ($ips.Count -eq 0) { $ips = @($ipSans) }
-        $resolved.Add([ordered]@{ name = $entry.name; ips = @($ips); from = $entry.from })
+        $resolved += [ordered]@{ name = $entry.name; ips = @($ips); from = $entry.from }
     }
     return [ordered]@{
         id            = ('{0}-{1}-{2}' -f $Issuer.name, $RequestId, $Serial)
@@ -844,7 +846,8 @@ function Get-RowsFromView {
     $kept = [bool]$IncludeExpired
     $text = [CaLedgerReader034]::Collect([string]$Issuer.config, $kept)
     if (-not $text) { return @() }
-    $records = @()
+    $script:KeptRows = 0
+    $records = New-Object System.Collections.ArrayList
     foreach ($line in ($text -split "\r?\n")) {
         if (-not $line) { continue }
         if ($line -like 'WARN *') {
@@ -877,13 +880,16 @@ function Get-RowsFromView {
                 'CertificateTemplate'  = [string]$f[4]
             }
             $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
-            if ($null -ne $record) { $records += $record }
+            if ($null -ne $record) {
+                [void]$records.Add($record)
+                $script:KeptRows++
+            }
         } catch {
             if (-not $script:RowReject) { $script:RowReject = $_.Exception.GetBaseException().Message }
         }
     }
-    if (-not $script:CertReject -and $script:RowReject) { $script:CertReject = $script:RowReject }
-    return ,$records
+    $script:CollectedRows = $records
+    return
 }
 
 function New-InventoryCertificate {
@@ -927,10 +933,16 @@ function ConvertFrom-CaBag {
     param($Issuer, $Bag)
     $disposition = ConvertTo-Disposition $Bag['Request.Disposition']
     if (-not $disposition) { $disposition = ConvertTo-Disposition $Bag['Disposition'] }
-    if ($disposition -ne 'issued' -and $disposition -ne 'revoked') { return $null }
+    if ($disposition -ne 'issued' -and $disposition -ne 'revoked') {
+        if (-not $script:RowReject) { $script:RowReject = "Skipped a database row. Disposition '$($Bag['Request.Disposition'])' is not issued or revoked." }
+        return $null
+    }
 
     $requestId = 0
-    if ($Bag.ContainsKey('RequestID') -and $Bag['RequestID']) { $requestId = [int]$Bag['RequestID'] }
+    if ($Bag.ContainsKey('RequestID') -and $Bag['RequestID']) {
+        $idText = [string]$Bag['RequestID']
+        if ($idText -match '(\d+)') { $requestId = [int]$Matches[1] }
+    }
     $requester = [string]$Bag['Request.RequesterName']
     $requestCn = [string]$Bag['Request.CommonName']
     $template = [string]$Bag['CertificateTemplate']
@@ -992,9 +1004,15 @@ function ConvertFrom-CaBag {
             if (-not $script:CertReject) { $script:CertReject = 'The certificate bytes are not a valid X.509 certificate.' }
         }
     }
-    if (-not $cn -or -not $notBefore -or -not $notAfter) { return $null }
+    if (-not $cn -or -not $notBefore -or -not $notAfter) {
+        if (-not $script:RowReject) { $script:RowReject = "Skipped request $requestId. Name or dates were empty." }
+        return $null
+    }
     if (-not $IncludeExpired) {
-        try { $expiry = [datetimeoffset]::Parse([string]$notAfter) } catch { return $null }
+        try { $expiry = [datetimeoffset]::Parse([string]$notAfter) } catch {
+            if (-not $script:RowReject) { $script:RowReject = "Skipped request $requestId. Could not read the expiration date '$notAfter'." }
+            return $null
+        }
         if ($expiry.UtcDateTime -le [datetime]::UtcNow) { return $null }
     }
     return New-InventoryRecord -Issuer $Issuer -RequestId $requestId -Serial $serial -CommonName $cn `
@@ -1509,7 +1527,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.5). One CA is enough; a two-tier PKI often has more."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.6). One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
@@ -1521,13 +1539,15 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
         try {
             $rows = @()
             try {
-                $rows = @(Get-RowsFromView -Issuer $issuer -NotAfterFrom ([datetime]::UtcNow))
+                Get-RowsFromView -Issuer $issuer -NotAfterFrom ([datetime]::UtcNow) | Out-Null
             } catch {
                 Write-Warning "Collection failed ($($_.Exception.Message))."
                 if (-not $script:CertReject) { $script:CertReject = $_.Exception.Message }
             }
-            foreach ($row in @($rows)) { if ($null -ne $row) { $certs += $row } }
-            Write-Host ("  {0} rows" -f @($rows).Count)
+            foreach ($row in @($script:CollectedRows)) {
+                if ($null -ne $row) { $certs += $row }
+            }
+            Write-Host ("  {0} rows" -f [int]$script:KeptRows)
         } catch {
             $message = $_.Exception.Message
             Write-Warning $message
@@ -1539,6 +1559,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     }
     if ($certs.Count -eq 0) {
         Write-Host 'No issued certificates were collected.'
+        if ($script:RowReject) { Write-Host ("  Row: {0}" -f $script:RowReject) }
         if ($script:CertReject) { Write-Host ("  Certificate decode: {0}" -f $script:CertReject) }
         foreach ($err in $errors) { Write-Host ("  {0}: {1}" -f $err.config, $err.message) }
         exit 1
