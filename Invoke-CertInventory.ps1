@@ -110,6 +110,7 @@ $script:ViewIncomplete = $false
 $script:DnsCache = @{}
 $script:CertUnreadable = 0
 $script:CertReject = ''
+$script:RowReject = ''
 $script:ProbeCache = @{}
 if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $SkipDns = $true
@@ -126,7 +127,9 @@ $CV_OUT_BINARY = 2
 function ConvertTo-NormalizedSerial {
     param([string] $Serial)
     if (-not $Serial) { return '0' }
-    $hex = ([regex]::Replace($Serial, '[^0-9a-fA-F]', '')).ToLower().TrimStart('0')
+    $hex = [regex]::Replace([string]$Serial, '[^0-9a-fA-F]', '')
+    $hex = $hex.ToLowerInvariant()
+    $hex = $hex -replace '^0+', ''
     if (-not $hex) { return '0' }
     return $hex
 }
@@ -378,7 +381,7 @@ function New-InventoryRecord {
     $names = New-Object System.Collections.Generic.List[object]
     if (Test-SystemName $CommonName) { $names.Add([ordered]@{ name = $CommonName; from = 'cn' }) }
     foreach ($san in @($Sans)) {
-        if ($san.type -eq 'dns' -and (Test-SystemName $san.value) -and $san.value.ToLower() -ne $CommonName.ToLower()) {
+        if ($san.type -eq 'dns' -and (Test-SystemName $san.value) -and $san.value.ToLowerInvariant() -ne $CommonName.ToLowerInvariant()) {
             $names.Add([ordered]@{ name = [string]$san.value; from = 'san' })
         }
     }
@@ -823,7 +826,12 @@ function Resolve-InventoryIps {
 function Get-Unquoted {
     param($Value)
     if ($null -eq $Value) { return '' }
-    return ([string]$Value).Trim().Trim([char]34).Trim()
+    $text = [string]$Value
+    $text = $text -replace '^\s+', ''
+    $text = $text -replace '\s+$', ''
+    $text = $text -replace '^"+', ''
+    $text = $text -replace '"+$', ''
+    return $text
 }
 
 function Get-RowsFromView {
@@ -836,7 +844,7 @@ function Get-RowsFromView {
     $kept = [bool]$IncludeExpired
     $text = [CaLedgerReader034]::Collect([string]$Issuer.config, $kept)
     if (-not $text) { return @() }
-    $records = New-Object System.Collections.Generic.List[object]
+    $records = @()
     foreach ($line in ($text -split "\r?\n")) {
         if (-not $line) { continue }
         if ($line -like 'WARN *') {
@@ -869,12 +877,13 @@ function Get-RowsFromView {
                 'CertificateTemplate'  = [string]$f[4]
             }
             $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
-            if ($null -ne $record) { $records.Add($record) }
+            if ($null -ne $record) { $records += $record }
         } catch {
-            if (-not $script:CertReject) { $script:CertReject = $_.Exception.GetBaseException().Message }
+            if (-not $script:RowReject) { $script:RowReject = $_.Exception.GetBaseException().Message }
         }
     }
-    return @($records)
+    if (-not $script:CertReject -and $script:RowReject) { $script:CertReject = $script:RowReject }
+    return ,$records
 }
 
 function New-InventoryCertificate {
@@ -1138,10 +1147,10 @@ function Select-InventorySan {
     param($Cert)
     $dns = @($Cert.sans | Where-Object { $_.type -eq 'dns' })
     foreach ($san in $dns) {
-        if ($san.value -like '*.*' -and $san.value.ToLower() -ne $Cert.cn.ToLower()) { return [string]$san.value }
+        if ($san.value -like '*.*' -and $san.value.ToLowerInvariant() -ne $Cert.cn.ToLowerInvariant()) { return [string]$san.value }
     }
     foreach ($san in $dns) {
-        if ($san.value.ToLower() -eq $Cert.cn.ToLower()) { return [string]$san.value }
+        if ($san.value.ToLowerInvariant() -eq $Cert.cn.ToLowerInvariant()) { return [string]$san.value }
     }
     if ($dns.Count -gt 0) { return [string]$dns[0].value }
     $ip = @($Cert.sans | Where-Object { $_.type -eq 'ip' })
@@ -1168,11 +1177,11 @@ function Get-SerialFindings {
     $findings = New-Object System.Collections.Generic.List[object]
     foreach ($cert in $valid) {
         $san = Select-InventorySan -Cert $cert
-        $key = ('{0}|{1}' -f $cert.cn.ToLower(), $san.ToLower())
+        $key = ('{0}|{1}' -f $cert.cn.ToLowerInvariant(), $san.ToLowerInvariant())
         if ($seen.ContainsKey($key)) { continue }
         $seen[$key] = $true
-        $cnCerts = @($valid | Where-Object { $_.cn.ToLower() -eq $cert.cn.ToLower() })
-        $sanCerts = @($valid | Where-Object { @($_.sans | Where-Object { $_.value.ToLower() -eq $san.ToLower() }).Count -gt 0 })
+        $cnCerts = @($valid | Where-Object { $_.cn.ToLowerInvariant() -eq $cert.cn.ToLowerInvariant() })
+        $sanCerts = @($valid | Where-Object { @($_.sans | Where-Object { $_.value.ToLowerInvariant() -eq $san.ToLowerInvariant() }).Count -gt 0 })
         $cnSerials = @($cnCerts | ForEach-Object { $_.serial } | Select-Object -Unique)
         $sanSerials = @($sanCerts | ForEach-Object { $_.serial } | Select-Object -Unique)
         $shared = @($cnSerials | Where-Object { $sanSerials -contains $_ })
@@ -1204,18 +1213,18 @@ function Get-ClientValidations {
     foreach ($cert in $valid) {
         $name = [string]$cert.cn
         $via = 'cn'
-        $key = ('cn|' + $name.ToLower())
+        $key = ('cn|' + $name.ToLowerInvariant())
         $matched = @()
         if (-not [string]::IsNullOrWhiteSpace($name)) {
-            $matched = @($valid | Where-Object { $_.cn.ToLower() -eq $name.ToLower() })
+            $matched = @($valid | Where-Object { $_.cn.ToLowerInvariant() -eq $name.ToLowerInvariant() })
         }
         if ($matched.Count -eq 0) {
             $via = 'san'
             $name = Select-InventorySan -Cert $cert
-            $key = ('san|' + $name.ToLower())
+            $key = ('san|' + $name.ToLowerInvariant())
             if ([string]::IsNullOrWhiteSpace($name)) { continue }
             $matched = @($valid | Where-Object {
-                @($_.sans | Where-Object { $_.value.ToLower() -eq $name.ToLower() }).Count -gt 0
+                @($_.sans | Where-Object { $_.value.ToLowerInvariant() -eq $name.ToLowerInvariant() }).Count -gt 0
             })
         }
         if ($seen.ContainsKey($key)) { continue }
@@ -1239,14 +1248,14 @@ function Get-CertClientNames {
     $cn = [string]$Cert.cn
     if (-not [string]::IsNullOrWhiteSpace($cn)) {
         $rows.Add([ordered]@{ client = $cn; via = 'cn' })
-        $seen[$cn.ToLower()] = $true
+        $seen[$cn.ToLowerInvariant()] = $true
     }
     foreach ($san in @($Cert.sans)) {
         if ($san.type -ne 'dns' -and $san.type -ne 'ip') { continue }
         $value = [string]$san.value
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
-        if ($seen.ContainsKey($value.ToLower())) { continue }
-        $seen[$value.ToLower()] = $true
+        if ($seen.ContainsKey($value.ToLowerInvariant())) { continue }
+        $seen[$value.ToLowerInvariant()] = $true
         $rows.Add([ordered]@{ client = $value; via = 'san' })
     }
     return @($rows)
@@ -1254,15 +1263,15 @@ function Get-CertClientNames {
 
 function Test-UnicastIpv4 {
     param([string] $Name)
-    $parts = $Name.Split('.')
+    $parts = @($Name -split '\.')
     if ($parts.Count -ne 4) { return $false }
-    $octets = New-Object System.Collections.Generic.List[int]
+    $octets = @()
     foreach ($part in $parts) {
-        $n = 0
-        if (-not [int]::TryParse($part, [ref]$n)) { return $false }
-        if ($part.Length -gt 1 -and $part.StartsWith('0')) { return $false }
+        if ($part -notmatch '^\d+$') { return $false }
+        if ($part.Length -gt 1 -and $part -like '0*') { return $false }
+        $n = [int]$part
         if ($n -lt 0 -or $n -gt 255) { return $false }
-        $octets.Add($n)
+        $octets += $n
     }
     if ($octets[0] -eq 0 -or $octets[0] -ge 224) { return $false }
     return $true
@@ -1500,12 +1509,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.4). One CA is enough; a two-tier PKI often has more."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.5). One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
-    $certs = New-Object System.Collections.Generic.List[object]
-    $errors = New-Object System.Collections.Generic.List[object]
+    $certs = @()
+    $errors = @()
     $script:ViewIncomplete = $false
     foreach ($issuer in $issuers) {
         Write-Host ("Collecting {0}" -f $issuer.config)
@@ -1517,12 +1526,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
                 Write-Warning "Collection failed ($($_.Exception.Message))."
                 if (-not $script:CertReject) { $script:CertReject = $_.Exception.Message }
             }
-            foreach ($row in @($rows)) { if ($null -ne $row) { $certs.Add($row) } }
+            foreach ($row in @($rows)) { if ($null -ne $row) { $certs += $row } }
             Write-Host ("  {0} rows" -f @($rows).Count)
         } catch {
             $message = $_.Exception.Message
             Write-Warning $message
-            $errors.Add([ordered]@{ config = $issuer.config; message = $message })
+            $errors += [ordered]@{ config = $issuer.config; message = $message }
         }
     }
     if ($script:CertUnreadable -gt 0) {
