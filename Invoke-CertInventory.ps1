@@ -207,7 +207,7 @@ function Read-DerLength {
 
 function Read-GeneralNames {
     param([byte[]] $Bytes)
-    $names = New-Object System.Collections.Generic.List[object]
+    $names = New-Object System.Collections.ArrayList
     if ($null -eq $Bytes -or $Bytes.Length -lt 2) { return @() }
     $offset = 0
     if ($Bytes[0] -eq 0x04) {
@@ -234,7 +234,7 @@ function Read-GeneralNames {
             $type = 'dns'
             if ($choice -eq 1) { $type = 'email' }
             if ($choice -eq 6) { $type = 'uri' }
-            $names.Add([ordered]@{ type = $type; value = $text })
+            [void]$names.Add([ordered]@{ type = $type; value = $text })
         } elseif ($choice -eq 7) {
             $ip = $null
             if ($payload.Length -eq 4) {
@@ -246,7 +246,7 @@ function Read-GeneralNames {
                 }
                 $ip = $parts -join ':'
             }
-            if ($ip) { $names.Add([ordered]@{ type = 'ip'; value = $ip }) }
+            if ($ip) { [void]$names.Add([ordered]@{ type = 'ip'; value = $ip }) }
         }
     }
     return @($names)
@@ -1122,7 +1122,7 @@ function Get-RowsFromCertutil {
             if ($part -and $part -match 'Request ID:') { $blocks += $part }
         }
     }
-    $records = New-Object System.Collections.Generic.List[object]
+    $records = New-Object System.Collections.ArrayList
     foreach ($block in $blocks) {
         try {
             $bag = @{}
@@ -1150,7 +1150,7 @@ function Get-RowsFromCertutil {
                 $bag['RawCertificate'] = Get-HexDumpBytes -Block $block
             }
             $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
-            if ($null -ne $record) { $records.Add($record) }
+            if ($null -ne $record) { [void]$records.Add($record) }
         } catch {
             if (-not $script:CertReject) { $script:CertReject = $_.Exception.GetBaseException().Message }
         }
@@ -1192,7 +1192,7 @@ function Get-SerialFindings {
     # The serial that lookup returns is the serial used for validation.
     $valid = @($Certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $Now })
     $seen = @{}
-    $findings = New-Object System.Collections.Generic.List[object]
+    $findings = New-Object System.Collections.ArrayList
     foreach ($cert in $valid) {
         $san = Select-InventorySan -Cert $cert
         $key = ('{0}|{1}' -f $cert.cn.ToLowerInvariant(), $san.ToLowerInvariant())
@@ -1211,7 +1211,7 @@ function Get-SerialFindings {
         elseif ($cnSerials.Count -eq $sanSerials.Count -and $shared.Count -eq $cnSerials.Count) { $kind = 'duplicate' }
         else { $kind = 'divergent' }
         if ($kind -eq 'match') { continue }
-        $findings.Add([ordered]@{
+        [void]$findings.Add([ordered]@{
             cn         = $cert.cn
             san        = $san
             kind       = $kind
@@ -1227,7 +1227,7 @@ function Get-ClientValidations {
     # Verify each client certificate by CN, or by exactly one SAN, then take its serial.
     $valid = @($Certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $Now })
     $seen = @{}
-    $rows = New-Object System.Collections.Generic.List[object]
+    $rows = New-Object System.Collections.ArrayList
     foreach ($cert in $valid) {
         $name = [string]$cert.cn
         $via = 'cn'
@@ -1248,7 +1248,7 @@ function Get-ClientValidations {
         if ($seen.ContainsKey($key)) { continue }
         $seen[$key] = $true
         $serials = @($matched | ForEach-Object { $_.serial } | Select-Object -Unique)
-        $rows.Add([ordered]@{
+        [void]$rows.Add([ordered]@{
             name     = $name
             via      = $via
             serials  = @($serials)
@@ -1261,11 +1261,11 @@ function Get-ClientValidations {
 $script:ProbeCache = @{}
 function Get-CertClientNames {
     param($Cert)
-    $rows = New-Object System.Collections.Generic.List[object]
+    $rows = New-Object System.Collections.ArrayList
     $seen = @{}
     $cn = [string]$Cert.cn
     if (-not [string]::IsNullOrWhiteSpace($cn)) {
-        $rows.Add([ordered]@{ client = $cn; via = 'cn' })
+        [void]$rows.Add([ordered]@{ client = $cn; via = 'cn' })
         $seen[$cn.ToLowerInvariant()] = $true
     }
     foreach ($san in @($Cert.sans)) {
@@ -1274,7 +1274,7 @@ function Get-CertClientNames {
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
         if ($seen.ContainsKey($value.ToLowerInvariant())) { continue }
         $seen[$value.ToLowerInvariant()] = $true
-        $rows.Add([ordered]@{ client = $value; via = 'san' })
+        [void]$rows.Add([ordered]@{ client = $value; via = 'san' })
     }
     return @($rows)
 }
@@ -1298,8 +1298,8 @@ function Test-UnicastIpv4 {
 function Test-DnsClientName {
     param([string] $Name)
     if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 253) { return $false }
-    if ($Name.StartsWith('.') -or $Name.EndsWith('.')) { return $false }
-    foreach ($label in $Name.Split('.')) {
+    if ($Name -like '.*' -or $Name -like '*.') { return $false }
+    foreach ($label in ($Name -split '\.')) {
         if ($label.Length -lt 1 -or $label.Length -gt 63) { return $false }
         if ($label -notmatch '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$') { return $false }
     }
@@ -1341,23 +1341,15 @@ function Get-ClientProbe {
         $target = [string]$ips[0]
         $result.address = $target
         try {
-            $ping = New-Object System.Net.NetworkInformation.Ping
-            $reply = $ping.Send($target, 1000)
-            if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+            $ok = $false
+            $pong = @(Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue)
+            if ($pong.Count -gt 0 -and $pong[0]) { $ok = $true }
+            if ($ok) {
                 $result.status = 'active'
+            } elseif ($isIp) {
+                $result.status = 'not-on-network'
             } else {
-                $down = @(
-                    [System.Net.NetworkInformation.IPStatus]::DestinationUnreachable,
-                    [System.Net.NetworkInformation.IPStatus]::DestinationHostUnreachable,
-                    [System.Net.NetworkInformation.IPStatus]::DestinationNetworkUnreachable,
-                    [System.Net.NetworkInformation.IPStatus]::DestinationProhibited,
-                    [System.Net.NetworkInformation.IPStatus]::DestinationProtocolUnreachable,
-                    [System.Net.NetworkInformation.IPStatus]::DestinationPortUnreachable,
-                    [System.Net.NetworkInformation.IPStatus]::HardwareError,
-                    [System.Net.NetworkInformation.IPStatus]::BadDestination
-                )
-                if ($down -contains $reply.Status -or $isIp) { $result.status = 'not-on-network' }
-                else { $result.status = 'inactive' }
+                $result.status = 'inactive'
             }
         } catch {
             $result.status = $(if ($isIp) { 'not-on-network' } else { 'inactive' })
@@ -1373,7 +1365,7 @@ function Get-ClientChecks {
     # Several clients on one certificate is expected, not a conflict.
     $valid = @($Certificates | Where-Object { Test-InventoryValid -Cert $_ -Now $Now })
     $checked = $Now.ToString('o')
-    $rows = New-Object System.Collections.Generic.List[object]
+    $rows = New-Object System.Collections.ArrayList
     foreach ($cert in $valid) {
         $fallback = @($cert.sans | Where-Object { $_.type -eq 'ip' -and (Test-UnicastIpv4 -Name ([string]$_.value)) } | Select-Object -First 1)
         $fallbackIp = if ($fallback.Count) { [string]$fallback[0].value } else { $null }
@@ -1388,7 +1380,7 @@ function Get-ClientChecks {
                 $status = 'not-in-dns'
                 $address = $null
             }
-            $rows.Add([ordered]@{
+            [void]$rows.Add([ordered]@{
                 certId    = $cert.id
                 serial    = $cert.serial
                 client    = $item.client
@@ -1441,11 +1433,10 @@ function Get-DemoSnapshot {
 
 function Write-InventoryJson {
     param($Snapshot, [string] $Path)
-    $json = $Snapshot | ConvertTo-Json -Depth 8
+    $json = $Snapshot | ConvertTo-Json -Depth 8 -Compress
     if ($Path -match "[\r\n\x00]") { throw "Output path is not valid." }
     $full = [System.IO.Path]::GetFullPath($Path)
-    $utf8 = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($full, $json, $utf8)
+    [System.IO.File]::WriteAllText($full, [string]$json)
     return $full
 }
 
@@ -1527,7 +1518,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.6). One CA is enough; a two-tier PKI often has more."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.7). One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
