@@ -406,8 +406,11 @@ function New-InventoryRecord {
 $script:CaReaderSource = @'
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
 
 public static class CaInventoryReader {
     const BindingFlags Call = BindingFlags.Instance | BindingFlags.Public | BindingFlags.InvokeMethod;
@@ -416,17 +419,109 @@ public static class CaInventoryReader {
         return com.GetType().InvokeMember(name, Call, null, com, args);
     }
 
-    public static List<Dictionary<string, object>> Read(string config) {
+    static bool IsHex(string text) {
+        if (string.IsNullOrEmpty(text) || (text.Length % 2) != 0) return false;
+        for (int i = 0; i < text.Length; i++) {
+            char c = text[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
+    }
+
+    static byte[] Decode(string payload) {
+        if (string.IsNullOrEmpty(payload)) return null;
+        string text = payload.Trim();
+        int begin = text.IndexOf("BEGIN CERTIFICATE", StringComparison.OrdinalIgnoreCase);
+        if (begin >= 0) {
+            int start = text.IndexOf("-----", begin + 10);
+            // header is -----BEGIN CERTIFICATE----- ; drop both markers
+            text = text.Replace("-----BEGIN CERTIFICATE-----", "");
+            text = text.Replace("-----END CERTIFICATE-----", "");
+        }
+        var compact = new StringBuilder(text.Length);
+        for (int i = 0; i < text.Length; i++) {
+            char c = text[i];
+            if (c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == '"') continue;
+            compact.Append(c);
+        }
+        string body = compact.ToString();
+        if (body.Length < 16) return null;
+        try {
+            if (IsHex(body)) {
+                var bytes = new byte[body.Length / 2];
+                for (int i = 0; i < bytes.Length; i++) {
+                    bytes[i] = byte.Parse(body.Substring(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+                }
+                return bytes;
+            }
+            return Convert.FromBase64String(body);
+        } catch {
+            return null;
+        }
+    }
+
+    public static Dictionary<string, string> Describe(string payload) {
+        byte[] der = Decode(payload);
+        if (der == null || der.Length < 16 || der[0] != 0x30) return null;
+        X509Certificate2 cert = new X509Certificate2(der);
+        var bag = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        bag["CommonName"] = cert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
+        bag["Subject"] = cert.Subject ?? "";
+        bag["Serial"] = cert.SerialNumber ?? "";
+        bag["NotBefore"] = cert.NotBefore.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+        bag["NotAfter"] = cert.NotAfter.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+        string san = "";
+        string template = "";
+        foreach (X509Extension ext in cert.Extensions) {
+            string oid = ext.Oid == null ? "" : ext.Oid.Value;
+            if (oid == "2.5.29.17" && ext.RawData != null) san = Convert.ToBase64String(ext.RawData);
+            if (oid == "1.3.6.1.4.1.311.20.2" || oid == "1.3.6.1.4.1.311.21.7") {
+                try { template = ext.Format(false); } catch { }
+            }
+        }
+        bag["San"] = san ?? "";
+        bag["Template"] = template ?? "";
+        return bag;
+    }
+
+    static string Box(object value) {
+        if (value == null || value is DBNull) return "";
+        byte[] raw = value as byte[];
+        if (raw != null) return Convert.ToBase64String(raw);
+        if (value is DateTime) {
+            DateTime when = (DateTime)value;
+            if (when.Kind == DateTimeKind.Unspecified) when = DateTime.SpecifyKind(when, DateTimeKind.Local);
+            return when.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+        }
+        Array array = value as Array;
+        if (array != null && !(value is string)) {
+            try {
+                var bytes = new byte[array.Length];
+                bool allBytes = true;
+                for (int i = 0; i < array.Length; i++) {
+                    object item = array.GetValue(i);
+                    if (item is byte) bytes[i] = (byte)item;
+                    else { allBytes = false; break; }
+                }
+                if (allBytes && bytes.Length > 0) return Convert.ToBase64String(bytes);
+            } catch { }
+        }
+        return Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+    }
+
+    public static List<Dictionary<string, string>> Read(string config) {
         Type kind = Type.GetTypeFromProgID("CertificateAuthority.View");
         if (kind == null) {
             throw new InvalidOperationException("CertificateAuthority.View is not registered. Install the Certification Authority tools.");
         }
         object view = Activator.CreateInstance(kind);
         object rowset = null;
-        var rows = new List<Dictionary<string, object>>();
+        var rows = new List<Dictionary<string, string>>();
         try {
             Exception opened = null;
-            foreach (string candidate in new string[] { config, "\\\\" + config }) {
+            string[] candidates = new string[] { config, "\\\\" + config };
+            foreach (string candidate in candidates) {
                 try {
                     CallMethod(view, "OpenConnection", new object[] { candidate });
                     opened = null;
@@ -450,24 +545,25 @@ public static class CaInventoryReader {
                     object index = CallMethod(view, "GetColumnIndex", new object[] { 0, column });
                     int value = Convert.ToInt32(index);
                     if (value >= 0) indexes.Add(value);
-                } catch {
-                }
+                } catch { }
             }
             if (indexes.Count == 0) throw new InvalidOperationException("No readable columns on " + config + ".");
             CallMethod(view, "SetResultColumnCount", new object[] { indexes.Count });
-            foreach (int index in indexes) {
-                CallMethod(view, "SetResultColumn", new object[] { index });
-            }
+            foreach (int index in indexes) CallMethod(view, "SetResultColumn", new object[] { index });
             rowset = CallMethod(view, "OpenView", null);
             while (true) {
-                object rowIndex = CallMethod(rowset, "Next", null);
+                object rowIndex;
+                try { rowIndex = CallMethod(rowset, "Next", null); }
+                catch { break; }
                 if (rowIndex == null || Convert.ToInt32(rowIndex) == -1) break;
                 object column = null;
                 try {
                     column = CallMethod(rowset, "EnumCertViewColumn", null);
-                    var bag = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                    var bag = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     while (true) {
-                        object colIndex = CallMethod(column, "Next", null);
+                        object colIndex;
+                        try { colIndex = CallMethod(column, "Next", null); }
+                        catch { break; }
                         if (colIndex == null || Convert.ToInt32(colIndex) == -1) break;
                         string name = "";
                         try { name = Convert.ToString(CallMethod(column, "GetName", null)); } catch { continue; }
@@ -478,10 +574,19 @@ public static class CaInventoryReader {
                             if (value == null) {
                                 try { value = CallMethod(column, "GetValue", new object[] { 1 }); } catch { }
                             }
+                            string encoded = Box(value);
+                            if (!string.IsNullOrEmpty(encoded)) {
+                                try {
+                                    Dictionary<string, string> described = Describe(encoded);
+                                    if (described != null) {
+                                        foreach (KeyValuePair<string, string> pair in described) bag["Parsed" + pair.Key] = pair.Value ?? "";
+                                    }
+                                } catch { }
+                            }
                         } else {
                             try { value = CallMethod(column, "GetValue", new object[] { 0 }); } catch { }
+                            bag[name] = Box(value);
                         }
-                        bag[name] = value;
                     }
                     rows.Add(bag);
                 } catch {
@@ -498,7 +603,7 @@ public static class CaInventoryReader {
         return rows;
     }
 }
-'@
+'@'@
 
 function Initialize-CaReader {
     if ([type]::GetType('CaInventoryReader')) { return $true }
@@ -511,13 +616,16 @@ function Initialize-CaReader {
     }
 }
 $script:DnsCache = @{}
+$script:CertUnreadable = 0
+$script:CertReject = ''
 function Resolve-InventoryIps {
     param([string] $Name)
     if ($script:DnsCache.ContainsKey($Name)) { return @($script:DnsCache[$Name]) }
     $ips = @()
     try {
         $task = [System.Net.Dns]::GetHostAddressesAsync($Name)
-        if ($task.Wait(2000) -and $task.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
+        try { $task.Wait([TimeSpan]::FromSeconds(2)) } catch { }
+        if ($task.IsCompleted -and -not $task.IsFaulted -and -not $task.IsCanceled) {
             $ips = @($task.Result |
                 Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
                 ForEach-Object { $_.IPAddressToString } |
@@ -541,17 +649,13 @@ function Get-RowsFromView {
     $rows = [CaInventoryReader]::Read([string]$Issuer.config)
     $records = New-Object System.Collections.Generic.List[object]
     foreach ($row in @($rows)) {
-        $bag = @{}
-        foreach ($key in @($row.Keys)) {
-            $value = $row[$key]
-            if ($value -is [DBNull]) { $value = $null }
-            $bag[[string]$key] = $value
-        }
         try {
+            $bag = @{}
+            foreach ($key in @($row.Keys)) { $bag[[string]$key] = [string]$row[$key] }
             $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
             if ($null -ne $record) { $records.Add($record) }
         } catch {
-            Write-Warning "Skipped request $($bag['RequestID']) on $($Issuer.config) ($($_.Exception.Message))."
+            if (-not $script:CertReject) { $script:CertReject = $_.Exception.GetBaseException().Message }
         }
     }
     return @($records)
@@ -612,31 +716,60 @@ function ConvertFrom-CaBag {
     $subject = ''
     $sans = @()
     $cn = $requestCn
-
-    $raw = ConvertTo-ByteArray $Bag['RawCertificate']
-    if ($raw) {
-        $cert = $null
-        try {
-            $cert = New-InventoryCertificate -Raw $raw
-            if ($null -eq $cert) { throw "The certificate bytes are not a valid X.509 certificate." }
-            $cn = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-            if (-not $cn) { $cn = $requestCn }
-            $subject = $cert.Subject
-            $serial = Get-CertificateSerial -Certificate $cert
-            $sans = @(Get-SanFromCertificate -Certificate $cert)
-            $fromCert = Get-TemplateFromCertificate -Certificate $cert
-            if ($fromCert) { $template = $fromCert }
-            $notBefore = $cert.NotBefore.ToUniversalTime().ToString('o')
-            $notAfter = $cert.NotAfter.ToUniversalTime().ToString('o')
-        } catch {
-            Write-Warning "Request $requestId on $($Issuer.config) could not be parsed as a certificate. The database name and dates are kept."
-        } finally {
-            if ($cert) { $cert.Dispose() }
+    $parsed = $false
+    if ($Bag['ParsedCommonName'] -or $Bag['ParsedSerial'] -or $Bag['ParsedNotAfter']) {
+        $parsed = $true
+        if ($Bag['ParsedCommonName']) { $cn = [string]$Bag['ParsedCommonName'] }
+        if ($Bag['ParsedSubject']) { $subject = [string]$Bag['ParsedSubject'] }
+        if ($Bag['ParsedSerial']) { $serial = ConvertTo-NormalizedSerial ([string]$Bag['ParsedSerial']) }
+        if ($Bag['ParsedNotBefore']) { $notBefore = [string]$Bag['ParsedNotBefore'] }
+        if ($Bag['ParsedNotAfter']) { $notAfter = [string]$Bag['ParsedNotAfter'] }
+        $templateText = [string]$Bag['ParsedTemplate']
+        if ($templateText -match '\(([^)]+)\)') { $template = $Matches[1] }
+        elseif ($templateText -match '=\s*(.+)$') { $template = $Matches[1].Trim() }
+        elseif ($templateText) { $template = $templateText }
+        if ($Bag['ParsedSan']) {
+            try {
+                $sans = @(Read-GeneralNames -Bytes ([Convert]::FromBase64String([string]$Bag['ParsedSan'])))
+            } catch { $sans = @() }
+        }
+    } elseif ($Bag['RawCertificate']) {
+        $payload = $Bag['RawCertificate']
+        if ($payload -is [System.Array]) {
+            $hex = New-Object System.Text.StringBuilder
+            foreach ($b in @($payload)) {
+                try { [void]$hex.Append(('{0:x2}' -f [byte]$b)) } catch { }
+            }
+            $payload = $hex.ToString()
+        }
+        $info = $null
+        if ($payload -and (Initialize-CaReader)) {
+            try { $info = [CaInventoryReader]::Describe([string]$payload) } catch {
+                if (-not $script:CertReject) { $script:CertReject = $_.Exception.GetBaseException().Message }
+            }
+        }
+        if ($info) {
+            $parsed = $true
+            if ($info['CommonName']) { $cn = [string]$info['CommonName'] }
+            if ($info['Subject']) { $subject = [string]$info['Subject'] }
+            if ($info['Serial']) { $serial = ConvertTo-NormalizedSerial ([string]$info['Serial']) }
+            if ($info['NotBefore']) { $notBefore = [string]$info['NotBefore'] }
+            if ($info['NotAfter']) { $notAfter = [string]$info['NotAfter'] }
+            $templateText = [string]$info['Template']
+            if ($templateText -match '\(([^)]+)\)') { $template = $Matches[1] }
+            elseif ($templateText -match '=\s*(.+)$') { $template = $Matches[1].Trim() }
+            elseif ($templateText) { $template = $templateText }
+            if ($info['San']) {
+                try { $sans = @(Read-GeneralNames -Bytes ([Convert]::FromBase64String([string]$info['San']))) } catch { $sans = @() }
+            }
+        } else {
+            $script:CertUnreadable++
+            if (-not $script:CertReject) { $script:CertReject = 'The certificate bytes are not a valid X.509 certificate.' }
         }
     }
     if (-not $cn -or -not $notBefore -or -not $notAfter) { return $null }
     if (-not $IncludeExpired) {
-        $expiry = [datetimeoffset]::Parse($notAfter)
+        try { $expiry = [datetimeoffset]::Parse([string]$notAfter) } catch { return $null }
         if ($expiry.UtcDateTime -le [datetime]::UtcNow) { return $null }
     }
     return New-InventoryRecord -Issuer $Issuer -RequestId $requestId -Serial $serial -CommonName $cn `
@@ -646,14 +779,14 @@ function ConvertFrom-CaBag {
 
 function Get-HexDumpBytes {
     param([string] $Block)
-    $list = New-Object System.Collections.Generic.List[byte]
+    $list = New-Object System.Text.StringBuilder
     $started = $false
     foreach ($line in ($Block -split "\r?\n")) {
         if ($line -match "Binary Certificate|Raw Certificate|RawCertificate") { $started = $true; continue }
         if (-not $started) { continue }
         $trim = $line.Trim()
         if (-not $trim) {
-            if ($list.Count -gt 0) { break }
+            if ($list.Length -gt 0) { break }
             continue
         }
         if ($trim -match "^[A-Za-z]") { break }
@@ -662,10 +795,10 @@ function Get-HexDumpBytes {
         if ($body -match "^(.*[0-9A-Fa-f]{2})\s{2,}[^0-9A-Fa-f\s].*$") { $body = $Matches[1].Trim() }
         $tokens = @($body -split "\s+" | Where-Object { $_ -match "^[0-9A-Fa-f]{2}$" })
         if ($tokens.Count -lt 1) { continue }
-        foreach ($hex in $tokens) { $list.Add([Convert]::ToByte($hex, 16)) }
+        foreach ($hex in $tokens) { [void]$list.Append($hex) }
     }
-    if ($list.Count -lt 16) { return $null }
-    return ,$list.ToArray()
+    if ($list.Length -lt 32) { return $null }
+    return $list.ToString()
 }
 
 function Invoke-CertutilText {
@@ -776,7 +909,7 @@ function Get-RowsFromCertutil {
             $record = ConvertFrom-CaBag -Issuer $Issuer -Bag $bag
             if ($null -ne $record) { $records.Add($record) }
         } catch {
-            Write-Warning "Skipped request $($bag['RequestID']) on $($Issuer.config) ($($_.Exception.Message))."
+            if (-not $script:CertReject) { $script:CertReject = $_.Exception.GetBaseException().Message }
         }
     }
     if ($records.Count -eq 0 -and $failedViews -eq $queries.Count) {
@@ -1151,7 +1284,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
     $snapshot = Get-DemoSnapshot
 } else {
     if ($IssuingCa.Count -lt 2) {
-        Write-Host "Collecting $($IssuingCa.Count) issuing CA. One CA is enough; a two-tier PKI often has more."
+        Write-Host "Collecting $($IssuingCa.Count) issuing CA (collector 0.3.1). One CA is enough; a two-tier PKI often has more."
     }
     $issuers = @()
     foreach ($config in $IssuingCa) { $issuers += Split-CaConfig -Config $config }
@@ -1174,8 +1307,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
                     $fallback = @(Get-RowsFromCertutil -Issuer $issuer)
                     if ($fallback.Count -gt 0) { $rows = $fallback }
                 } catch {
-                    if (@($rows).Count -eq 0) { throw }
-                    Write-Warning "certutil fallback failed ($($_.Exception.Message)). Using the $(@($rows).Count) certificates already read."
+                    Write-Warning "certutil fallback failed ($($_.Exception.Message))."
                 }
             }
             foreach ($row in @($rows)) { if ($null -ne $row) { $certs.Add($row) } }
@@ -1186,8 +1318,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Demo') {
             $errors.Add([ordered]@{ config = $issuer.config; message = $message })
         }
     }
+    if ($script:CertUnreadable -gt 0) {
+        Write-Warning ("{0} database rows had certificate bytes that could not be read. {1}" -f $script:CertUnreadable, $script:CertReject)
+    }
     if ($certs.Count -eq 0) {
         Write-Host 'No issued certificates were collected.'
+        if ($script:CertReject) { Write-Host ("  Certificate decode: {0}" -f $script:CertReject) }
         foreach ($err in $errors) { Write-Host ("  {0}: {1}" -f $err.config, $err.message) }
         exit 1
     }
